@@ -178,14 +178,23 @@ func TestRollbackCountsSameCodexTurnIDOnce(t *testing.T) {
 		t.Fatalf("users=%v active=%v nodes=%#v", users, c.ActivePath(), c.Nodes)
 	}
 }
-func TestPatchStatsReturnsStructuredFileChange(t *testing.T) {
-	got := patchStats(map[string]any{
+func TestPatchDocumentRendersApplyPatch(t *testing.T) {
+	got := patchDocument(map[string]any{
 		"a.go": map[string]any{"type": "update", "unified_diff": "--- a/a.go\n+++ b/a.go\n+new\n-old\n"},
 		"b.go": map[string]any{"type": "add", "content": "one\ntwo\n"},
 	})
-	for _, want := range []string{`"files":["a.go","b.go"]`, `"added":3`, `"removed":1`} {
+	for _, want := range []string{
+		"*** Begin Patch",
+		"*** Update File: a.go",
+		"+new",
+		"-old",
+		"*** Add File: b.go",
+		"+one",
+		"+two",
+		"*** End Patch",
+	} {
 		if !strings.Contains(got, want) {
-			t.Fatalf("missing %s in %s", want, got)
+			t.Fatalf("missing %q in:\n%s", want, got)
 		}
 	}
 }

@@ -27,7 +27,7 @@ type Options struct {
 type Factory struct{}
 
 func (Factory) Descriptor() plugin.Descriptor {
-	return plugin.Descriptor{Type: "codex", DisplayName: "Codex", ParserVersion: "2", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	return plugin.Descriptor{Type: "codex", DisplayName: "Codex", ParserVersion: "3", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
@@ -201,7 +201,7 @@ func (s *codexParse) eventMsg(p map[string]any, ts time.Time, turnID string) *do
 	case "patch_apply_end":
 		if ok, _ := p["success"].(bool); ok {
 			if changes := common.Map(p["changes"]); len(changes) > 0 {
-				return &domain.Event{Kind: domain.EventFileChange, Text: patchStats(changes), Timestamp: ts, RawType: "patch_apply_end", TurnID: turnID}
+				return &domain.Event{Kind: domain.EventFileChange, Text: patchDocument(changes), Timestamp: ts, RawType: "patch_apply_end", TurnID: turnID}
 			}
 		}
 	}
@@ -212,50 +212,50 @@ func codexTurnID(p map[string]any) string {
 	return common.String(common.Map(p["internal_chat_message_metadata_passthrough"])["turn_id"])
 }
 
-// patchStats summarizes a patch_apply_end "changes" map into a JSON blob with
-// the affected file names and the total added/removed line counts.
-func patchStats(changes map[string]any) string {
-	adds, dels := 0, 0
+// patchDocument renders a patch_apply_end "changes" map as an apply_patch document
+// (the same *** Begin/End Patch format Codex uses for the request) so the host can
+// show the real per-file diff rather than only aggregate counts. Update files embed
+// their unified_diff verbatim; add/delete files list their content as +/- lines.
+// The host derives added/removed counts from these +/- lines (codexPatchStats).
+func patchDocument(changes map[string]any) string {
 	names := make([]string, 0, len(changes))
-	for name, v := range changes {
-		m := common.Map(v)
+	for name := range changes {
 		names = append(names, name)
-		switch common.String(m["type"]) {
-		case "add":
-			adds += lineCount(common.String(m["content"]))
-		case "delete":
-			dels += lineCount(common.String(m["content"]))
-		default:
-			a, d := diffLineCounts(common.String(m["unified_diff"]))
-			adds += a
-			dels += d
-		}
 	}
 	sort.Strings(names)
-	b, _ := json.Marshal(map[string]any{"files": names, "added": adds, "removed": dels})
-	return string(b)
-}
-
-// lineCount counts the lines in a block of text, ignoring a single trailing newline.
-func lineCount(content string) int {
-	return len(strings.Split(strings.TrimSuffix(content, "\n"), "\n"))
-}
-
-// diffLineCounts counts added and removed lines in a unified diff, ignoring the
-// "+++"/"---" file headers.
-func diffLineCounts(diff string) (adds, dels int) {
-	for _, line := range strings.Split(diff, "\n") {
-		if strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "---") {
-			continue
-		}
-		if strings.HasPrefix(line, "+") {
-			adds++
-		}
-		if strings.HasPrefix(line, "-") {
-			dels++
+	var b strings.Builder
+	b.WriteString("*** Begin Patch")
+	for _, name := range names {
+		m := common.Map(changes[name])
+		switch common.String(m["type"]) {
+		case "add":
+			b.WriteString("\n*** Add File: " + name)
+			for _, ln := range patchBodyLines(common.String(m["content"])) {
+				b.WriteString("\n+" + ln)
+			}
+		case "delete":
+			b.WriteString("\n*** Delete File: " + name)
+			for _, ln := range patchBodyLines(common.String(m["content"])) {
+				b.WriteString("\n-" + ln)
+			}
+		default: // update / rename
+			b.WriteString("\n*** Update File: " + name)
+			if ud := strings.TrimRight(common.String(m["unified_diff"]), "\n"); ud != "" {
+				b.WriteString("\n" + ud)
+			}
 		}
 	}
-	return adds, dels
+	b.WriteString("\n*** End Patch")
+	return b.String()
+}
+
+// patchBodyLines splits file content into lines, dropping a single trailing newline
+// and returning nil for empty content (so an empty file contributes no body lines).
+func patchBodyLines(content string) []string {
+	if content == "" {
+		return nil
+	}
+	return strings.Split(strings.TrimSuffix(content, "\n"), "\n")
 }
 
 // codexOutputText flattens tool output into plain text, unwrapping the JSON
