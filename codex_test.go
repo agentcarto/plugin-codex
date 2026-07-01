@@ -30,6 +30,27 @@ func TestParseNormalizesRolesAndMetaTail(t *testing.T) {
 		t.Fatalf("%#v", ev)
 	}
 }
+func TestParseSkipsEmptyReasoning(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "rollout-x-id.jsonl")
+	data := `{"timestamp":"2025-01-01T00:00:00Z","type":"session_meta","payload":{"id":"id","cwd":"/work"}}
+{"timestamp":"2025-01-01T00:00:01Z","type":"response_item","payload":{"type":"reasoning","encrypted_content":"gAAAA","summary":[]}}
+{"timestamp":"2025-01-01T00:00:02Z","type":"response_item","payload":{"type":"reasoning","summary":[{"text":"visible summary"}]}}
+`
+	if e := os.WriteFile(p, []byte(data), 0600); e != nil {
+		t.Fatal(e)
+	}
+	ev, _, _, _, _, _ := parse(context.Background(), p)
+	var reasoning []string
+	for _, e := range ev {
+		if e.Kind == domain.EventReasoning {
+			reasoning = append(reasoning, e.Text)
+		}
+	}
+	if len(reasoning) != 1 || reasoning[0] != "visible summary" {
+		t.Fatalf("expected only the non-empty reasoning, got %#v", reasoning)
+	}
+}
+
 func TestRollbackConversationKeepsDeadBranch(t *testing.T) {
 	ev := []domain.Event{{Kind: domain.EventUser, Text: "q1"}, {Kind: domain.EventAssistant, Text: "a1"}, {Kind: domain.EventUser, Text: "q2"}, {Kind: domain.EventAssistant, Text: "a2"}, {Kind: domain.EventMeta, Text: "1", RawType: "thread_rolled_back"}, {Kind: domain.EventUser, Text: "q2'"}}
 	c := rollbackConversation(ev, "thread_rolled_back")

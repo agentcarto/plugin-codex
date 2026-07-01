@@ -126,6 +126,12 @@ func (s *codexParse) responseItem(p map[string]any, ts time.Time, turnID string)
 		if text == "" {
 			text = common.Text(p["summary"])
 		}
+		// Reasoning is stored encrypted (encrypted_content) with an empty plaintext
+		// summary unless model_reasoning_summary is enabled; skip rather than emit a
+		// blank reasoning event.
+		if strings.TrimSpace(text) == "" {
+			return nil
+		}
 		return &domain.Event{Kind: domain.EventReasoning, Text: text, Timestamp: ts, RawType: pt, TurnID: turnID}
 	case "function_call", "local_shell_call", "custom_tool_call", "web_search_call":
 		text := common.String(p["arguments"])
