@@ -27,7 +27,9 @@ type Options struct {
 type Factory struct{}
 
 func (Factory) Descriptor() plugin.Descriptor {
-	return plugin.Descriptor{Type: "codex", DisplayName: "Codex", ParserVersion: "5", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	// ParserVersion=6: user events now carry the normalized Prompt field
+	// (agent-specific pseudo-prompt vocabulary moved out of core).
+	return plugin.Descriptor{Type: "codex", DisplayName: "Codex", ParserVersion: "6", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
@@ -119,7 +121,7 @@ func (s *codexParse) consume(o map[string]any) {
 	var e *domain.Event
 	switch typ {
 	case "compacted":
-		ce := domain.Event{Kind: domain.EventUser, Text: strings.TrimSpace(common.String(p["message"])), Timestamp: ts, RawType: "compact_summary", TurnID: turnID}
+		ce := domain.Event{Kind: domain.EventUser, Text: strings.TrimSpace(common.String(p["message"])), Timestamp: ts, RawType: domain.RawCompactSummary, TurnID: turnID}
 		if s.turnHasItems {
 			s.pendingCompacts = append(s.pendingCompacts, ce)
 			return
@@ -224,7 +226,11 @@ func (s *codexParse) message(p map[string]any, ts time.Time, turnID string) *dom
 			s.flushCompacts()
 		}
 	}
-	return &domain.Event{Kind: kind, Text: text, Timestamp: ts, RawType: "message", TurnID: turnID}
+	ev := domain.Event{Kind: kind, Text: text, Timestamp: ts, RawType: "message", TurnID: turnID}
+	if kind == domain.EventUser {
+		ev.Prompt = promptText(text)
+	}
+	return &ev
 }
 
 // messageKind decides the base event kind for a non-assistant message. Roles
@@ -485,7 +491,7 @@ func rollbackTo(markerText string, nodes []domain.ConvNode, users *[]string, par
 // isRealUserTurn reports whether an event represents a genuine user turn (not a
 // preamble or compact summary) for the purposes of rollback counting.
 func isRealUserTurn(e domain.Event) bool {
-	return e.Kind == domain.EventUser && e.RawType != "compact_summary" && !codexIsPreamble(e.Text)
+	return e.Kind == domain.EventUser && e.RawType != domain.RawCompactSummary && !codexIsPreamble(e.Text)
 }
 
 // codexPreambles are the wrappers Codex injects into user messages; messages
@@ -500,6 +506,24 @@ func codexIsPreamble(text string) bool {
 		}
 	}
 	return false
+}
+
+// promptText returns the cleaned, whitespace-folded genuine prompt in text,
+// or "" when the message is a Codex-injected preamble, an AGENTS.md dump, or
+// a short single-line slash command rather than real user input.
+func promptText(text string) string {
+	t := strings.TrimSpace(text)
+	if t == "" || codexIsPreamble(t) {
+		return ""
+	}
+	low := strings.ToLower(t)
+	if strings.HasPrefix(low, "# agents.md instructions") || strings.HasPrefix(low, "agents.md instructions") {
+		return ""
+	}
+	if strings.HasPrefix(t, "/") && !strings.Contains(t, "\n") && len([]rune(t)) <= 40 {
+		return ""
+	}
+	return strings.Join(strings.Fields(t), " ")
 }
 
 func (p *Plugin) ResumeCommand(s domain.Session) (domain.Command, error) {
