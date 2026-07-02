@@ -496,3 +496,102 @@ func TestDetectActiveDeduplicatesCodexWrapperAndRuntimeProcessesByCWD(t *testing
 		t.Fatalf("newest same-cwd session should be active: %#v", ss[3])
 	}
 }
+
+// codexTurnStarts must count exactly what the display counts as turns: queued
+// input (after an abort or with an already-seen turn_id) is not a turn,
+// compaction summaries are, and thread_rolled_back drops popped turns.
+func TestCodexTurnStartsMatchesDisplayRules(t *testing.T) {
+	lines := [][]byte{
+		[]byte(`{"type":"session_meta","payload":{"id":"id","cwd":"/w"}}`),
+		[]byte(`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"t1"}],"internal_chat_message_metadata_passthrough":{"turn_id":"T1"}}}`),
+		[]byte(`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"queued same turn"}],"internal_chat_message_metadata_passthrough":{"turn_id":"T1"}}}`),
+		[]byte(`{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"T1"}}`),
+		[]byte(`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"queued after abort"}],"internal_chat_message_metadata_passthrough":{"turn_id":"T1"}}}`),
+		[]byte(`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"t2"}],"internal_chat_message_metadata_passthrough":{"turn_id":"T2"}}}`),
+		[]byte(`{"type":"compacted","payload":{"message":"Your conversation was summarized"}}`),
+		[]byte(`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"t3"}],"internal_chat_message_metadata_passthrough":{"turn_id":"T3"}}}`),
+	}
+	got := codexTurnStarts(lines)
+	want := []int{1, 5, 6, 7} // t1, t2, compaction, t3 — the two queued messages don't start turns
+	if len(got) != len(want) {
+		t.Fatalf("starts=%v want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("starts=%v want %v", got, want)
+		}
+	}
+}
+
+func TestCodexTurnStartsRollbackDropsPoppedTurns(t *testing.T) {
+	lines := [][]byte{
+		[]byte(`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"t1"}]}}`),
+		[]byte(`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"t2"}]}}`),
+		[]byte(`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"t3"}]}}`),
+		[]byte(`{"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":2}}`),
+		[]byte(`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"t2'"}]}}`),
+	}
+	got := codexTurnStarts(lines)
+	want := []int{0, 4} // t1 and t2' survive; t2, t3 were rolled back
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("starts=%v want %v", got, want)
+	}
+}
+
+// A fork of a session containing queued input must cut at the displayed-turn
+// boundary: KeepTurns counts displayed turns, not raw user messages.
+func TestPlanForkCutsAtDisplayedTurnWithQueuedInput(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "rollout-2025-01-01T00-00-00-abc.jsonl")
+	data := `{"type":"session_meta","payload":{"id":"abc","cwd":"/w"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"t1"}],"internal_chat_message_metadata_passthrough":{"turn_id":"T1"}}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"queued"}],"internal_chat_message_metadata_passthrough":{"turn_id":"T1"}}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"t2"}],"internal_chat_message_metadata_passthrough":{"turn_id":"T2"}}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"t3"}],"internal_chat_message_metadata_passthrough":{"turn_id":"T3"}}}
+`
+	if e := os.WriteFile(f, []byte(data), 0600); e != nil {
+		t.Fatal(e)
+	}
+	p := &Plugin{id: "codex", o: Options{SessionsDir: dir, Executable: "codex"}}
+	s := domain.Session{PluginID: "codex", SessionID: "abc", SourceRef: domain.SessionRef{Source: f}}
+	// Keep 2 displayed turns: t1 (with its queued message) and t2; t3 is dropped.
+	plan, _, e := p.PlanFork(context.Background(), s, domain.ForkTarget{KeepTurns: 2})
+	if e != nil {
+		t.Fatal(e)
+	}
+	out := string(plan.Writes[0].Data)
+	if !strings.Contains(out, "queued") || !strings.Contains(out, `"t2"`) {
+		t.Fatalf("fork lost kept content:\n%s", out)
+	}
+	if strings.Contains(out, `"t3"`) {
+		t.Fatalf("fork kept content past the cut:\n%s", out)
+	}
+	// KeepTurns beyond the displayed total is rejected.
+	if _, _, e := p.PlanFork(context.Background(), s, domain.ForkTarget{KeepTurns: 4}); e == nil {
+		t.Fatal("want out-of-range error: raw user messages must not inflate the total")
+	}
+}
+
+// Untouched lines of the fork copy survive byte-for-byte (numbers, escaping).
+func TestPlanForkPreservesLineFidelity(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "rollout-2025-01-01T00-00-00-abc.jsonl")
+	raw := `{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"t1"}]},"big":9007199254740993,"s":"<x>"}`
+	data := `{"type":"session_meta","payload":{"id":"abc","cwd":"/w"}}` + "\n" + raw + "\n"
+	if e := os.WriteFile(f, []byte(data), 0600); e != nil {
+		t.Fatal(e)
+	}
+	p := &Plugin{id: "codex", o: Options{SessionsDir: dir, Executable: "codex"}}
+	s := domain.Session{PluginID: "codex", SessionID: "abc", SourceRef: domain.SessionRef{Source: f}}
+	plan, _, e := p.PlanFork(context.Background(), s, domain.ForkTarget{KeepTurns: 1})
+	if e != nil {
+		t.Fatal(e)
+	}
+	out := string(plan.Writes[0].Data)
+	if !strings.Contains(out, raw) {
+		t.Fatalf("non-meta line was rewritten:\n%s", out)
+	}
+	if !strings.Contains(out, `"forked_from_id":"abc"`) {
+		t.Fatalf("session_meta not tagged:\n%s", out)
+	}
+}

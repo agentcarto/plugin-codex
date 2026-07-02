@@ -27,7 +27,7 @@ type Options struct {
 type Factory struct{}
 
 func (Factory) Descriptor() plugin.Descriptor {
-	return plugin.Descriptor{Type: "codex", DisplayName: "Codex", ParserVersion: "3", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	return plugin.Descriptor{Type: "codex", DisplayName: "Codex", ParserVersion: "4", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
@@ -682,67 +682,132 @@ func (p *Plugin) PlanFork(_ context.Context, s domain.Session, t domain.ForkTarg
 	if e != nil {
 		return domain.MutationPlan{}, domain.Command{}, e
 	}
-	total := countCodexUserTurns(b)
+	lines := bytes.Split(b, []byte("\n"))
+	starts := codexTurnStarts(lines)
+	total := len(starts)
 	keep := t.KeepTurns
 	if keep < 0 || keep > total {
 		return domain.MutationPlan{}, domain.Command{}, fmt.Errorf("keep turns %d outside 0..%d", keep, total)
 	}
+	cut := len(lines)
+	if keep < total {
+		cut = starts[keep] // keep everything before the (keep+1)-th displayed turn
+	}
 
 	// Build a copy truncated at the chosen point as a new session (the original
 	// is left untouched). Tag session_meta with forked_from_id so the manager
-	// links the fork to its parent.
+	// links the fork to its parent. Lines other than session_meta are copied
+	// verbatim so the fork does not corrupt numbers or escaping.
 	newID := common.NewID()
 	var out bytes.Buffer
-	seen := 0
-	for _, line := range bytes.Split(b, []byte("\n")) {
+	for _, line := range lines[:cut] {
 		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
-		var o map[string]any
-		if json.Unmarshal(line, &o) != nil {
+		o, e := common.UnmarshalJSONMap(line)
+		if e != nil || common.String(o["type"]) != "session_meta" {
+			out.Write(line)
+			out.WriteByte('\n')
 			continue
 		}
 		pl := common.Map(o["payload"])
-		if isCodexUserMessage(pl) {
-			seen++
-			if seen > keep {
-				break // drop everything past the number of turns we keep
-			}
+		if pl == nil {
+			pl = map[string]any{}
+			o["payload"] = pl
 		}
-		if common.String(o["type"]) == "session_meta" {
-			pl["id"] = newID
-			pl["forked_from_id"] = s.SessionID
+		pl["id"] = newID
+		pl["forked_from_id"] = s.SessionID
+		x, e := common.MarshalJSONLine(o)
+		if e != nil {
+			return domain.MutationPlan{}, domain.Command{}, e
 		}
-		x, _ := json.Marshal(o)
 		out.Write(x)
-		out.WriteByte('\n')
 	}
 	path := filepath.Join(filepath.Dir(s.SourceRef.Source), "rollout-"+time.Now().UTC().Format("2006-01-02T15-04-05")+"-"+newID+".jsonl")
 	plan := domain.MutationPlan{PluginID: p.id, Description: "fork Codex session", AllowedRoots: []string{p.o.SessionsDir}, Writes: []domain.FileWrite{{Path: path, Data: out.Bytes(), Mode: 0600}}}
 	return plan, domain.Command{Executable: p.o.Executable, Args: []string{"resume", newID}, WorkingDirectory: s.CWD}, nil
 }
 
-// countCodexUserTurns counts the genuine user turns in a rollout's raw bytes.
-func countCodexUserTurns(b []byte) int {
-	total := 0
-	for _, line := range bytes.Split(b, []byte("\n")) {
+// codexTurnStarts returns, in order, the line indexes at which each *displayed*
+// turn of the rollout starts. It mirrors the parser/display rules exactly, so
+// a KeepTurns computed from the rendered conversation truncates at the right
+// line: queued user messages (the one following a turn_aborted, or repeats
+// within an already-seen turn_id) do not start a turn, compaction summaries
+// do (they are turn boundaries in TurnsOfPath), and thread_rolled_back drops
+// the last num_turns user turns together with everything after them.
+func codexTurnStarts(lines [][]byte) []int {
+	type start struct {
+		line int
+		user bool // a real user turn (poppable by thread_rolled_back), not a compaction
+	}
+	var starts []start
+	seenUserTurn := map[string]bool{}
+	pendingAbort := false
+	users := 0
+	for i, line := range lines {
 		var o map[string]any
 		if json.Unmarshal(line, &o) != nil {
 			continue
 		}
-		if isCodexUserMessage(common.Map(o["payload"])) {
-			total++
+		pl := common.Map(o["payload"])
+		switch common.String(o["type"]) {
+		case "compacted":
+			starts = append(starts, start{line: i})
+		case "response_item":
+			if !isCodexUserMessage(pl) {
+				continue
+			}
+			turnID := codexTurnID(pl)
+			if pendingAbort || (turnID != "" && seenUserTurn[turnID]) {
+				pendingAbort = false
+				continue // queued input on an existing/aborted turn
+			}
+			seenUserTurn[turnID] = true
+			starts = append(starts, start{line: i, user: true})
+			users++
+		case "event_msg":
+			switch common.String(pl["type"]) {
+			case "turn_aborted":
+				pendingAbort = true
+			case "thread_rolled_back":
+				n := 0
+				fmt.Sscan(fmt.Sprint(pl["num_turns"]), &n)
+				if n <= 0 || n > users {
+					continue
+				}
+				for j := len(starts) - 1; j >= 0; j-- {
+					if starts[j].user {
+						if n--; n == 0 {
+							starts = starts[:j]
+							break
+						}
+					}
+				}
+				users = 0
+				for _, x := range starts {
+					if x.user {
+						users++
+					}
+				}
+			}
 		}
 	}
-	return total
+	out := make([]int, len(starts))
+	for i, x := range starts {
+		out[i] = x.line
+	}
+	return out
 }
 
 // isCodexUserMessage reports whether a payload is a real user message (a user
-// chat message that is not an injected preamble).
+// chat message that is not an injected preamble or AGENTS.md instructions,
+// matching what messageKind renders as a user event).
 func isCodexUserMessage(pl map[string]any) bool {
-	return common.String(pl["type"]) == "message" &&
-		common.String(pl["role"]) == "user" &&
-		!codexIsPreamble(common.Text(pl["content"]))
+	if common.String(pl["type"]) != "message" || common.String(pl["role"]) != "user" {
+		return false
+	}
+	text := common.Text(pl["content"])
+	return !codexIsPreamble(text) && !strings.Contains(text, "# AGENTS.md instructions")
 }
 
 func (p *Plugin) PlanRelocate(_ context.Context, old, new string, sessions []domain.Session) (domain.MutationPlan, error) {
