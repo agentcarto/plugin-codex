@@ -282,6 +282,130 @@ func TestParseCodexCompactedAsCompactSummary(t *testing.T) {
 	}
 }
 
+// The new auto-compaction format writes the compacted record in the middle of
+// the turn it interrupted (message is empty; the summary is encrypted). The
+// boundary must be deferred past the turn's remaining output so the final
+// reply stays on its own turn, not on the compaction's.
+func TestParseCodexCompactedMidTurnDefersBoundary(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "rollout-x-id.jsonl")
+	data := `{"timestamp":"2025-01-01T00:00:00Z","type":"session_meta","payload":{"id":"id","cwd":"/work"}}
+{"timestamp":"2025-01-01T00:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"T1"}}
+{"timestamp":"2025-01-01T00:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"t1"}],"internal_chat_message_metadata_passthrough":{"turn_id":"T1"}}}
+{"timestamp":"2025-01-01T00:00:03Z","type":"response_item","payload":{"type":"function_call","name":"exec","arguments":"{}","internal_chat_message_metadata_passthrough":{"turn_id":"T1"}}}
+{"timestamp":"2025-01-01T00:00:04Z","type":"compacted","payload":{"message":"","replacement_history":[]}}
+{"timestamp":"2025-01-01T00:00:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"text":"final reply"}],"internal_chat_message_metadata_passthrough":{"turn_id":"T1"}}}
+{"timestamp":"2025-01-01T00:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"T1"}}
+{"timestamp":"2025-01-01T00:00:07Z","type":"event_msg","payload":{"type":"task_started","turn_id":"T2"}}
+{"timestamp":"2025-01-01T00:00:08Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"t2"}],"internal_chat_message_metadata_passthrough":{"turn_id":"T2"}}}
+`
+	if e := os.WriteFile(p, []byte(data), 0600); e != nil {
+		t.Fatal(e)
+	}
+	ev, _, _, _, _, _ := parse(context.Background(), p)
+	order := map[string]int{}
+	for i, e := range ev {
+		if e.RawType == "compact_summary" {
+			order["compact"] = i
+		}
+		if e.Kind == domain.EventAssistant {
+			order["reply"] = i
+		}
+		if e.Kind == domain.EventUser && e.Text == "t2" {
+			order["t2"] = i
+		}
+	}
+	if _, ok := order["compact"]; !ok {
+		t.Fatalf("compact_summary missing: %#v", ev)
+	}
+	if !(order["reply"] < order["compact"] && order["compact"] < order["t2"]) {
+		t.Fatalf("want reply < compact < t2, got %v", order)
+	}
+	pl := &Plugin{}
+	c, err := pl.LoadConversation(context.Background(), domain.SessionRef{Source: p})
+	if err != nil {
+		t.Fatal(err)
+	}
+	turns := convlogic.TurnsOfPath(*c, c.ActivePath())
+	turnOf := func(match func(domain.Event) bool) int {
+		for ti, turn := range turns {
+			for _, id := range turn {
+				for _, e := range c.Nodes[id].Events {
+					if match(e) {
+						return ti
+					}
+				}
+			}
+		}
+		return -1
+	}
+	t1 := turnOf(func(e domain.Event) bool { return e.Kind == domain.EventUser && e.Text == "t1" })
+	reply := turnOf(func(e domain.Event) bool { return e.Kind == domain.EventAssistant })
+	t2 := turnOf(func(e domain.Event) bool { return e.Kind == domain.EventUser && e.Text == "t2" })
+	if t1 != reply {
+		t.Fatalf("final reply left its turn: t1=%d reply=%d turns=%v", t1, reply, turns)
+	}
+	if t2 == reply {
+		t.Fatalf("final reply leaked into the next turn: %v", turns)
+	}
+}
+
+// A compaction written between task_started and the turn's first item (compact
+// on submit) keeps its position: the boundary stays before the new turn.
+func TestParseCodexCompactedAtTurnStartStaysBeforeTurn(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "rollout-x-id.jsonl")
+	data := `{"timestamp":"2025-01-01T00:00:00Z","type":"session_meta","payload":{"id":"id","cwd":"/work"}}
+{"timestamp":"2025-01-01T00:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"T1"}}
+{"timestamp":"2025-01-01T00:00:02Z","type":"compacted","payload":{"message":"","replacement_history":[]}}
+{"timestamp":"2025-01-01T00:00:03Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"t1"}],"internal_chat_message_metadata_passthrough":{"turn_id":"T1"}}}
+`
+	if e := os.WriteFile(p, []byte(data), 0600); e != nil {
+		t.Fatal(e)
+	}
+	ev, _, _, _, _, _ := parse(context.Background(), p)
+	compact, user := -1, -1
+	for i, e := range ev {
+		if e.RawType == "compact_summary" {
+			compact = i
+		}
+		if e.Kind == domain.EventUser && e.Text == "t1" {
+			user = i
+		}
+	}
+	if compact < 0 || user < 0 || compact > user {
+		t.Fatalf("want compact before user turn, compact=%d user=%d ev=%#v", compact, user, ev)
+	}
+}
+
+// tool_search_call/tool_search_output must surface as tool events: the call with
+// its JSON arguments, the output as the list of found tool names.
+func TestParseCodexToolSearch(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "rollout-x-id.jsonl")
+	data := `{"timestamp":"2025-01-01T00:00:00Z","type":"session_meta","payload":{"id":"id","cwd":"/work"}}
+{"timestamp":"2025-01-01T00:00:01Z","type":"response_item","payload":{"type":"tool_search_call","call_id":"c1","arguments":{"limit":3,"query":"serena"},"metadata":{"turn_id":"T1"}}}
+{"timestamp":"2025-01-01T00:00:02Z","type":"response_item","payload":{"type":"tool_search_output","call_id":"c1","status":"completed","tools":[{"name":"mcp__serena","description":"d","tools":[{"name":"initial_instructions"},{"name":"open_dashboard"}]},{"name":"standalone"}]}}
+`
+	if e := os.WriteFile(p, []byte(data), 0600); e != nil {
+		t.Fatal(e)
+	}
+	ev, _, _, _, _, _ := parse(context.Background(), p)
+	if len(ev) != 2 {
+		t.Fatalf("want 2 events, got %#v", ev)
+	}
+	call, out := ev[0], ev[1]
+	if call.Kind != domain.EventToolCall || call.ToolName != "tool_search" || call.TurnID != "T1" {
+		t.Fatalf("call=%#v", call)
+	}
+	if !strings.Contains(call.Text, `"query":"serena"`) {
+		t.Fatalf("call args lost: %q", call.Text)
+	}
+	if out.Kind != domain.EventToolResult {
+		t.Fatalf("out=%#v", out)
+	}
+	if out.Text != "mcp__serena: initial_instructions, open_dashboard\nstandalone" {
+		t.Fatalf("out text=%q", out.Text)
+	}
+}
+
 func TestScanCodexForkParentMetadata(t *testing.T) {
 	root := t.TempDir()
 	day := filepath.Join(root, "2026", "06", "23")
@@ -512,7 +636,10 @@ func TestCodexTurnStartsMatchesDisplayRules(t *testing.T) {
 		[]byte(`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"t3"}],"internal_chat_message_metadata_passthrough":{"turn_id":"T3"}}}`),
 	}
 	got := codexTurnStarts(lines)
-	want := []int{1, 5, 6, 7} // t1, t2, compaction, t3 — the two queued messages don't start turns
+	// t1, t2, compaction, t3 — the two queued messages don't start turns. The
+	// compaction follows response items with no task_started in between, so its
+	// boundary is deferred to the next user turn (line 7), like the parser does.
+	want := []int{1, 5, 7, 7}
 	if len(got) != len(want) {
 		t.Fatalf("starts=%v want %v", got, want)
 	}
@@ -535,6 +662,64 @@ func TestCodexTurnStartsRollbackDropsPoppedTurns(t *testing.T) {
 	want := []int{0, 4} // t1 and t2' survive; t2, t3 were rolled back
 	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
 		t.Fatalf("starts=%v want %v", got, want)
+	}
+}
+
+// A compaction record in the middle of a turn's items starts its displayed turn
+// at the next task_started, so cutting there keeps the interrupted turn whole
+// (including the final reply written after the compacted line).
+func TestCodexTurnStartsDefersMidTurnCompaction(t *testing.T) {
+	lines := [][]byte{
+		[]byte(`{"type":"session_meta","payload":{"id":"abc","cwd":"/w"}}`),
+		[]byte(`{"type":"event_msg","payload":{"type":"task_started","turn_id":"T1"}}`),
+		[]byte(`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"t1"}],"internal_chat_message_metadata_passthrough":{"turn_id":"T1"}}}`),
+		[]byte(`{"type":"compacted","payload":{"message":"","replacement_history":[]}}`),
+		[]byte(`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"text":"final reply"}],"internal_chat_message_metadata_passthrough":{"turn_id":"T1"}}}`),
+		[]byte(`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"T1"}}`),
+		[]byte(`{"type":"event_msg","payload":{"type":"task_started","turn_id":"T2"}}`),
+		[]byte(`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"t2"}],"internal_chat_message_metadata_passthrough":{"turn_id":"T2"}}}`),
+	}
+	got := codexTurnStarts(lines)
+	want := []int{2, 6, 7} // t1; deferred compaction at the next task_started; t2
+	if len(got) != len(want) {
+		t.Fatalf("starts=%v want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("starts=%v want %v", got, want)
+		}
+	}
+}
+
+// Forking right after a turn interrupted by auto-compaction keeps that turn's
+// trailing output, which codex wrote after the compacted record.
+func TestPlanForkKeepsReplyWrittenAfterMidTurnCompaction(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "rollout-2025-01-01T00-00-00-abc.jsonl")
+	data := `{"type":"session_meta","payload":{"id":"abc","cwd":"/w"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"T1"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"t1"}],"internal_chat_message_metadata_passthrough":{"turn_id":"T1"}}}
+{"type":"compacted","payload":{"message":"","replacement_history":[]}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"text":"final reply"}],"internal_chat_message_metadata_passthrough":{"turn_id":"T1"}}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"T1"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"T2"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"t2"}],"internal_chat_message_metadata_passthrough":{"turn_id":"T2"}}}
+`
+	if e := os.WriteFile(f, []byte(data), 0600); e != nil {
+		t.Fatal(e)
+	}
+	p := &Plugin{id: "codex", o: Options{SessionsDir: dir, Executable: "codex"}}
+	s := domain.Session{PluginID: "codex", SessionID: "abc", SourceRef: domain.SessionRef{Source: f}}
+	plan, _, e := p.PlanFork(context.Background(), s, domain.ForkTarget{KeepTurns: 1})
+	if e != nil {
+		t.Fatal(e)
+	}
+	out := string(plan.Writes[0].Data)
+	if !strings.Contains(out, "final reply") {
+		t.Fatalf("fork lost the reply written after the compacted record:\n%s", out)
+	}
+	if strings.Contains(out, `"t2"`) {
+		t.Fatalf("fork kept content past the cut:\n%s", out)
 	}
 }
 

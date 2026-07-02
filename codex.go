@@ -27,7 +27,7 @@ type Options struct {
 type Factory struct{}
 
 func (Factory) Descriptor() plugin.Descriptor {
-	return plugin.Descriptor{Type: "codex", DisplayName: "Codex", ParserVersion: "4", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	return plugin.Descriptor{Type: "codex", DisplayName: "Codex", ParserVersion: "5", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
@@ -60,6 +60,14 @@ type codexParse struct {
 	// pendingAbortTurnID holds the turn that was just aborted, so the next user
 	// message is attached to it as queued input.
 	pendingAbortTurnID string
+	// turnHasItems reports whether the turn in flight has produced response items.
+	// Codex writes an auto-compaction record either before a turn's items (compact
+	// on submit) or in their middle (compact while streaming); only the latter must
+	// be deferred so the turn's remaining output stays on its own side of the boundary.
+	turnHasItems bool
+	// pendingCompacts holds mid-turn compaction events until the turn's items are
+	// done (the next task_started, or end of file).
+	pendingCompacts []domain.Event
 }
 
 func parse(ctx context.Context, path string) ([]domain.Event, string, string, string, string, time.Time) {
@@ -68,10 +76,17 @@ func parse(ctx context.Context, path string) ([]domain.Event, string, string, st
 		s.consume(o)
 		return nil
 	})
+	s.flushCompacts()
 	if s.id == "" {
 		s.id = common.IDFromPath(path)
 	}
 	return s.events, s.cwd, s.id, s.model, s.parent, s.start
+}
+
+// flushCompacts emits the compaction events deferred from the middle of a turn.
+func (s *codexParse) flushCompacts() {
+	s.events = append(s.events, s.pendingCompacts...)
+	s.pendingCompacts = nil
 }
 
 // consume processes a single decoded JSONL record, updating session metadata
@@ -104,10 +119,20 @@ func (s *codexParse) consume(o map[string]any) {
 	var e *domain.Event
 	switch typ {
 	case "compacted":
-		e = &domain.Event{Kind: domain.EventUser, Text: strings.TrimSpace(common.String(p["message"])), Timestamp: ts, RawType: "compact_summary", TurnID: turnID}
+		ce := domain.Event{Kind: domain.EventUser, Text: strings.TrimSpace(common.String(p["message"])), Timestamp: ts, RawType: "compact_summary", TurnID: turnID}
+		if s.turnHasItems {
+			s.pendingCompacts = append(s.pendingCompacts, ce)
+			return
+		}
+		e = &ce
 	case "response_item":
+		s.turnHasItems = true
 		e = s.responseItem(p, ts, turnID)
 	case "event_msg":
+		if common.String(p["type"]) == "task_started" {
+			s.flushCompacts()
+			s.turnHasItems = false
+		}
 		e = s.eventMsg(p, ts, turnID)
 	}
 	if e != nil {
@@ -141,8 +166,40 @@ func (s *codexParse) responseItem(p map[string]any, ts time.Time, turnID string)
 		return &domain.Event{Kind: domain.EventToolCall, Text: text, Timestamp: ts, ToolName: common.String(p["name"]), RawType: pt, TurnID: turnID}
 	case "function_call_output", "local_shell_call_output", "custom_tool_call_output", "web_search_call_output":
 		return &domain.Event{Kind: domain.EventToolResult, Text: codexOutputText(p["output"]), Timestamp: ts, RawType: pt, TurnID: turnID}
+	case "tool_search_call":
+		// Arguments are a JSON object here, unlike function_call's pre-encoded
+		// string (json.Marshal sorts map keys, so the text is deterministic).
+		args, _ := json.Marshal(p["arguments"])
+		return &domain.Event{Kind: domain.EventToolCall, Text: string(args), Timestamp: ts, ToolName: "tool_search", RawType: pt, TurnID: turnID}
+	case "tool_search_output":
+		return &domain.Event{Kind: domain.EventToolResult, Text: toolSearchResultText(p["tools"]), Timestamp: ts, RawType: pt, TurnID: turnID}
 	}
 	return nil
+}
+
+// toolSearchResultText renders a tool_search_output "tools" list as one line per
+// entry: the server/tool name followed by its nested tool names. Descriptions and
+// parameter schemas are omitted; the names are what identify the search result.
+func toolSearchResultText(v any) string {
+	var lines []string
+	for _, t := range common.Slice(v) {
+		m := common.Map(t)
+		name := common.String(m["name"])
+		if name == "" {
+			continue
+		}
+		var subs []string
+		for _, st := range common.Slice(m["tools"]) {
+			if n := common.String(common.Map(st)["name"]); n != "" {
+				subs = append(subs, n)
+			}
+		}
+		if len(subs) > 0 {
+			name += ": " + strings.Join(subs, ", ")
+		}
+		lines = append(lines, name)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // message handles a chat message payload. Assistant messages emit their text
@@ -160,6 +217,12 @@ func (s *codexParse) message(p map[string]any, ts time.Time, turnID string) *dom
 	kind := messageKind(role, text)
 	if kind == domain.EventUser {
 		kind, turnID = s.classifyUserMessage(turnID)
+		if kind == domain.EventUser {
+			// A new user turn ends any turn a compaction interrupted; place the
+			// deferred boundary before the turn (rollouts without task_started
+			// records have no other flush point).
+			s.flushCompacts()
+		}
 	}
 	return &domain.Event{Kind: kind, Text: text, Timestamp: ts, RawType: "message", TurnID: turnID}
 }
@@ -215,7 +278,11 @@ func (s *codexParse) eventMsg(p map[string]any, ts time.Time, turnID string) *do
 }
 
 func codexTurnID(p map[string]any) string {
-	return common.String(common.Map(p["internal_chat_message_metadata_passthrough"])["turn_id"])
+	if id := common.String(common.Map(p["internal_chat_message_metadata_passthrough"])["turn_id"]); id != "" {
+		return id
+	}
+	// tool_search_call and similar newer items carry the turn in "metadata" instead.
+	return common.String(common.Map(p["metadata"])["turn_id"])
 }
 
 // patchDocument renders a patch_apply_end "changes" map as an apply_patch document
@@ -734,7 +801,10 @@ func (p *Plugin) PlanFork(_ context.Context, s domain.Session, t domain.ForkTarg
 // line: queued user messages (the one following a turn_aborted, or repeats
 // within an already-seen turn_id) do not start a turn, compaction summaries
 // do (they are turn boundaries in TurnsOfPath), and thread_rolled_back drops
-// the last num_turns user turns together with everything after them.
+// the last num_turns user turns together with everything after them. A
+// compaction record written in the middle of a turn's items is deferred to the
+// next task_started (or EOF), matching the parser, so cutting at the compact
+// turn keeps the interrupted turn's trailing output.
 func codexTurnStarts(lines [][]byte) []int {
 	type start struct {
 		line int
@@ -743,6 +813,8 @@ func codexTurnStarts(lines [][]byte) []int {
 	var starts []start
 	seenUserTurn := map[string]bool{}
 	pendingAbort := false
+	turnHasItems := false
+	pendingCompacts := 0
 	users := 0
 	for i, line := range lines {
 		var o map[string]any
@@ -752,8 +824,13 @@ func codexTurnStarts(lines [][]byte) []int {
 		pl := common.Map(o["payload"])
 		switch common.String(o["type"]) {
 		case "compacted":
+			if turnHasItems {
+				pendingCompacts++
+				continue
+			}
 			starts = append(starts, start{line: i})
 		case "response_item":
+			turnHasItems = true
 			if !isCodexUserMessage(pl) {
 				continue
 			}
@@ -762,11 +839,19 @@ func codexTurnStarts(lines [][]byte) []int {
 				pendingAbort = false
 				continue // queued input on an existing/aborted turn
 			}
+			for ; pendingCompacts > 0; pendingCompacts-- {
+				starts = append(starts, start{line: i}) // deferred compaction lands before the new turn
+			}
 			seenUserTurn[turnID] = true
 			starts = append(starts, start{line: i, user: true})
 			users++
 		case "event_msg":
 			switch common.String(pl["type"]) {
+			case "task_started":
+				for ; pendingCompacts > 0; pendingCompacts-- {
+					starts = append(starts, start{line: i})
+				}
+				turnHasItems = false
 			case "turn_aborted":
 				pendingAbort = true
 			case "thread_rolled_back":
@@ -791,6 +876,9 @@ func codexTurnStarts(lines [][]byte) []int {
 				}
 			}
 		}
+	}
+	for ; pendingCompacts > 0; pendingCompacts-- {
+		starts = append(starts, start{line: len(lines)})
 	}
 	out := make([]int, len(starts))
 	for i, x := range starts {
