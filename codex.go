@@ -29,7 +29,9 @@ type Factory struct{}
 func (Factory) Descriptor() plugin.Descriptor {
 	// ParserVersion=6: user events now carry the normalized Prompt field
 	// (agent-specific pseudo-prompt vocabulary moved out of core).
-	return plugin.Descriptor{Type: "codex", DisplayName: "Codex", ParserVersion: "6", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	// ParserVersion=7: tool calls carry ToolArg and apply_patch/file_change
+	// events carry Changes (agent-specific rendering moved out of the host).
+	return plugin.Descriptor{Type: "codex", DisplayName: "Codex", ParserVersion: "7", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
@@ -79,6 +81,7 @@ func parse(ctx context.Context, path string) ([]domain.Event, string, string, st
 		return nil
 	})
 	s.flushCompacts()
+	annotateTools(s.events)
 	if s.id == "" {
 		s.id = common.IDFromPath(path)
 	}
