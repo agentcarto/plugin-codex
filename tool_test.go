@@ -1,28 +1,10 @@
 package codex
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/agentcarto/core/domain"
 )
-
-func TestSplitPatch(t *testing.T) {
-	patch := "*** Begin Patch\n*** Update File: a.go\n@@\n-old\n+new\n*** Add File: b.txt\n+one\n+two\n*** End Patch"
-	cs := splitPatch(patch)
-	if len(cs) != 2 {
-		t.Fatalf("changes=%+v", cs)
-	}
-	if cs[0].Path != "a.go" || cs[0].Op != "update" || cs[0].Added != 1 || cs[0].Removed != 1 || !strings.Contains(cs[0].Diff, "-old") {
-		t.Fatalf("cs[0]=%+v", cs[0])
-	}
-	if cs[1].Path != "b.txt" || cs[1].Op != "add" || cs[1].Added != 2 || cs[1].Removed != 0 {
-		t.Fatalf("cs[1]=%+v", cs[1])
-	}
-	if strings.Contains(cs[0].Diff, "*** ") {
-		t.Fatalf("header leaked into diff: %q", cs[0].Diff)
-	}
-}
 
 func TestExecSummary(t *testing.T) {
 	cases := []struct{ in, want string }{
@@ -54,12 +36,5 @@ func TestAnnotateToolsPatchAndFileChange(t *testing.T) {
 	}
 	if events[2].ToolArg != "make check" {
 		t.Fatalf("exec=%+v", events[2])
-	}
-}
-
-func TestSplitPatchDiffLessUpdate(t *testing.T) {
-	cs := splitPatch("*** Begin Patch\n*** Update File: a.go\n*** End Patch")
-	if len(cs) != 1 || cs[0].Diff != "" || cs[0].Added != 0 {
-		t.Fatalf("cs=%+v", cs)
 	}
 }

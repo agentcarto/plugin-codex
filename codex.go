@@ -523,7 +523,7 @@ func promptText(text string) string {
 	if strings.HasPrefix(low, "# agents.md instructions") || strings.HasPrefix(low, "agents.md instructions") {
 		return ""
 	}
-	if strings.HasPrefix(t, "/") && !strings.Contains(t, "\n") && len([]rune(t)) <= 40 {
+	if common.IsBareSlashCommand(t) {
 		return ""
 	}
 	return strings.Join(strings.Fields(t), " ")

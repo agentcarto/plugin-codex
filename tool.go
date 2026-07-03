@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/agentcarto/core/common"
 	"github.com/agentcarto/core/domain"
 )
 
@@ -29,7 +30,7 @@ func annotateTools(events []domain.Event) {
 		switch e.Kind {
 		case domain.EventToolCall:
 			if e.ToolName == "apply_patch" || strings.Contains(e.Text, "*** Begin Patch") {
-				e.Changes = splitPatch(patchText(e.Text))
+				e.Changes = common.SplitPatch(patchText(e.Text))
 				e.ToolArg = "apply_patch"
 				continue
 			}
@@ -37,7 +38,7 @@ func annotateTools(events []domain.Event) {
 				e.ToolArg = execSummary(e.Text)
 			}
 		case domain.EventFileChange:
-			e.Changes = splitPatch(e.Text)
+			e.Changes = common.SplitPatch(e.Text)
 		}
 	}
 }
@@ -67,46 +68,6 @@ func patchText(raw string) string {
 		}
 	}
 	return raw
-}
-
-// splitPatch converts an apply_patch document into normalized per-file
-// changes: the "*** ... File:" headers become Path/Op (dropped from Diff, the
-// host re-renders them) and the +/- lines are counted per file.
-func splitPatch(patch string) []domain.FileChange {
-	var out []domain.FileChange
-	var bodies [][]string
-	ci := -1
-	for _, line := range strings.Split(patch, "\n") {
-		if line == "*** Begin Patch" || line == "*** End Patch" {
-			continue
-		}
-		op, path := "", ""
-		for prefix, o := range map[string]string{"*** Add File: ": "add", "*** Update File: ": "update", "*** Delete File: ": "delete"} {
-			if strings.HasPrefix(line, prefix) {
-				op, path = o, strings.TrimSpace(strings.TrimPrefix(line, prefix))
-				break
-			}
-		}
-		if path != "" {
-			out = append(out, domain.FileChange{Path: path, Op: op})
-			bodies = append(bodies, nil)
-			ci = len(out) - 1
-			continue
-		}
-		if ci < 0 {
-			continue
-		}
-		bodies[ci] = append(bodies[ci], line)
-		if strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++") {
-			out[ci].Added++
-		} else if strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---") {
-			out[ci].Removed++
-		}
-	}
-	for i := range out {
-		out[i].Diff = strings.Join(bodies[i], "\n")
-	}
-	return out
 }
 
 var codexCmdRE = regexp.MustCompile(`"?cmd"?\s*:\s*"((?:[^"\\]|\\.)*)"`)
