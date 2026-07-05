@@ -30,6 +30,37 @@ func TestParseNormalizesRolesAndMetaTail(t *testing.T) {
 		t.Fatalf("%#v", ev)
 	}
 }
+// Each event is stamped with the model in force when it was produced. A
+// turn_context that changes the model mid-session applies to later events,
+// while the session-level model stays the first one seen.
+func TestParsePerTurnModel(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "rollout-x-id.jsonl")
+	data := `{"timestamp":"2025-01-01T00:00:00Z","type":"session_meta","payload":{"id":"id","cwd":"/work","model":"gpt-5-codex"}}
+{"timestamp":"2025-01-01T00:00:01Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"text":"a1"}]}}
+{"timestamp":"2025-01-01T00:00:02Z","type":"turn_context","payload":{"model":"gpt-5.1-codex"}}
+{"timestamp":"2025-01-01T00:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"text":"a2"}]}}
+`
+	if e := os.WriteFile(p, []byte(data), 0600); e != nil {
+		t.Fatal(e)
+	}
+	ev, _, _, model, _, _ := parse(context.Background(), p)
+	if model != "gpt-5-codex" {
+		t.Fatalf("session model = %q, want first model", model)
+	}
+	got := map[string]string{}
+	for _, e := range ev {
+		if e.Kind == domain.EventAssistant {
+			got[e.Text] = e.Model
+		}
+	}
+	if got["a1"] != "gpt-5-codex" {
+		t.Fatalf("a1 model = %q, want gpt-5-codex", got["a1"])
+	}
+	if got["a2"] != "gpt-5.1-codex" {
+		t.Fatalf("a2 model = %q, want gpt-5.1-codex", got["a2"])
+	}
+}
+
 func TestParseSkipsEmptyReasoning(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "rollout-x-id.jsonl")
 	data := `{"timestamp":"2025-01-01T00:00:00Z","type":"session_meta","payload":{"id":"id","cwd":"/work"}}

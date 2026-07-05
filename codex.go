@@ -56,8 +56,13 @@ type codexParse struct {
 	cwd    string
 	id     string
 	model  string
-	parent string
-	start  time.Time
+	// curModel is the model in force for records seen so far. session_meta and
+	// each turn_context update it, and every emitted event is stamped with it so
+	// the host can show per-turn models. model (above) keeps the first value as
+	// the session-level fallback.
+	curModel string
+	parent   string
+	start    time.Time
 	// seenUserTurn tracks turn IDs whose first user message has already been
 	// emitted, so later messages on the same turn are marked queued.
 	seenUserTurn map[string]bool
@@ -108,14 +113,18 @@ func (s *codexParse) consume(o map[string]any) {
 		s.id = common.String(p["id"])
 		s.cwd = common.String(p["cwd"])
 		s.model = common.String(p["model"])
+		s.curModel = s.model
 		s.parent = common.String(p["forked_from_id"])
 		return
 	case "turn_context":
 		if s.cwd == "" {
 			s.cwd = common.String(p["cwd"])
 		}
-		if s.model == "" {
-			s.model = common.String(p["model"])
+		if m := common.String(p["model"]); m != "" {
+			if s.model == "" {
+				s.model = m
+			}
+			s.curModel = m
 		}
 		return
 	}
@@ -141,6 +150,9 @@ func (s *codexParse) consume(o map[string]any) {
 		e = s.eventMsg(p, ts, turnID)
 	}
 	if e != nil {
+		if e.Model == "" {
+			e.Model = s.curModel
+		}
 		s.events = append(s.events, *e)
 	}
 }
@@ -215,7 +227,7 @@ func (s *codexParse) message(p map[string]any, ts time.Time, turnID string) *dom
 	text := common.Text(p["content"])
 	if role == "assistant" {
 		if strings.TrimSpace(text) != "" {
-			s.events = append(s.events, domain.Event{Kind: domain.EventAssistant, Text: text, Timestamp: ts, RawType: "message", TurnID: turnID})
+			s.events = append(s.events, domain.Event{Kind: domain.EventAssistant, Text: text, Timestamp: ts, RawType: "message", TurnID: turnID, Model: s.curModel})
 		}
 		return &domain.Event{Kind: domain.EventTurnComplete, Timestamp: ts, RawType: "turn_complete", TurnID: turnID}
 	}
