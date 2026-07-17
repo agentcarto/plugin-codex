@@ -567,12 +567,16 @@ func (p *Plugin) DetectActive(ctx context.Context, ss []domain.Session, ps []dom
 }
 
 // countCodexProcessesByCWD marks sessions that match a process exactly and, for
-// the remaining Codex processes, counts how many run in each working directory.
-// A direct runtime and its wrapper share a CWD, so direct counts replace wrapper
-// counts for the same directory to avoid double-counting a single session.
+// unmatched terminal-launched Codex processes, counts how many run in each cwd.
+// IDE-managed processes have no shell ancestor and are excluded. A direct runtime
+// and its wrapper share a cwd, so direct counts replace wrapper counts there.
 func (p *Plugin) countCodexProcessesByCWD(ss []domain.Session, ps []domain.Process, matched map[string]bool) map[string]int {
 	directCWDCounts := map[string]int{}
 	wrapperCWDCounts := map[string]int{}
+	processByPID := make(map[int32]domain.Process, len(ps))
+	for _, pr := range ps {
+		processByPID[pr.PID] = pr
+	}
 	for _, pr := range ps {
 		exact := false
 		for i := range ss {
@@ -581,7 +585,7 @@ func (p *Plugin) countCodexProcessesByCWD(ss []domain.Session, ps []domain.Proce
 				exact = true
 			}
 		}
-		if !p.isCodexProcess(pr) {
+		if !p.isCodexProcess(pr) || isCodexAppServerProcess(pr) || !hasShellAncestor(pr, processByPID) {
 			continue
 		}
 		if pr.CWD != "" && !exact {
@@ -654,6 +658,38 @@ func (p *Plugin) isCodexProcess(pr domain.Process) bool {
 // (as opposed to a wrapper that merely passes Codex as an argument).
 func (p *Plugin) isCodexDirectProcess(pr domain.Process) bool {
 	return matchesExecName(pr.Executable, p.executableName())
+}
+
+// isCodexAppServerProcess detects the long-lived server mode used by IDE ACP integrations.
+func isCodexAppServerProcess(pr domain.Process) bool {
+	for _, arg := range pr.Args {
+		if arg == "app-server" {
+			return true
+		}
+	}
+	return false
+}
+
+var shellProcessNames = map[string]bool{
+	"sh": true, "bash": true, "zsh": true, "fish": true, "dash": true, "ksh": true,
+	"cmd": true, "cmd.exe": true, "powershell": true, "powershell.exe": true, "pwsh": true, "pwsh.exe": true,
+}
+
+// hasShellAncestor distinguishes terminal-launched processes from IDE services.
+func hasShellAncestor(pr domain.Process, processByPID map[int32]domain.Process) bool {
+	seen := map[int32]bool{}
+	for ppid := pr.PPID; ppid != 0 && !seen[ppid]; {
+		seen[ppid] = true
+		parent, ok := processByPID[ppid]
+		if !ok {
+			return false
+		}
+		if shellProcessNames[strings.ToLower(filepath.Base(parent.Executable))] {
+			return true
+		}
+		ppid = parent.PPID
+	}
+	return false
 }
 
 func codexProcessMatches(s domain.Session, ps []domain.Process) bool {

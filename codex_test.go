@@ -30,6 +30,7 @@ func TestParseNormalizesRolesAndMetaTail(t *testing.T) {
 		t.Fatalf("%#v", ev)
 	}
 }
+
 // Each event is stamped with the model in force when it was produced. A
 // turn_context that changes the model mid-session applies to later events,
 // while the session-level model stays the first one seen.
@@ -559,96 +560,85 @@ func TestDetectActiveMatchesRolloutUUIDFromOpenFile(t *testing.T) {
 	}
 }
 
-func TestDetectActiveMatchesLatestSessionByCodexProcessCWD(t *testing.T) {
+func TestDetectActiveIgnoresProcessesMatchedOnlyByCWD(t *testing.T) {
 	p := &Plugin{o: Options{Executable: "codex"}}
-	old := domain.Session{
+	sessions := []domain.Session{{
 		PluginID:  "codex",
 		AgentType: "codex",
-		SessionID: "old",
-		CWD:       "/work",
-		UpdatedAt: time.Unix(10, 0),
-		LastKind:  domain.EventUser,
-	}
-	newer := domain.Session{
-		PluginID:  "codex",
-		AgentType: "codex",
-		SessionID: "new",
+		SessionID: "completed",
 		CWD:       "/work",
 		UpdatedAt: time.Unix(20, 0),
 		LastKind:  domain.EventTurnComplete,
+	}}
+	processes := []domain.Process{
+		{PID: 1, Executable: "phpstorm"},
+		// JetBrains launches a plain wrapper/runtime pair directly, without a shell ancestor.
+		{PID: 2, PPID: 1, Executable: "node", Args: []string{"node", "/opt/bin/codex"}, CWD: "/work"},
+		{PID: 3, PPID: 2, Executable: "codex", Args: []string{"/opt/vendor/bin/codex"}, CWD: "/work"},
+		{PID: 4, Executable: "zsh"},
+		// app-server is never a conversation, even when launched from a shell.
+		{PID: 5, PPID: 4, Executable: "node", Args: []string{"node", "/opt/node_modules/@openai/codex/bin/codex.js", "app-server"}, CWD: "/work"},
+		{PID: 6, PPID: 5, Executable: "codex", Args: []string{"/opt/vendor/bin/codex", "app-server"}, CWD: "/work"},
 	}
-	other := domain.Session{
+
+	ss, err := p.DetectActive(context.Background(), sessions, processes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ss[0].Status != "" {
+		t.Fatalf("processes without direct session evidence should not mark a same-cwd session active: %#v", ss[0])
+	}
+}
+
+func TestDetectActiveFallsBackToCWDForTerminalProcess(t *testing.T) {
+	p := &Plugin{o: Options{Executable: "codex"}}
+	sessions := []domain.Session{{
 		PluginID:  "codex",
 		AgentType: "codex",
-		SessionID: "other",
-		CWD:       "/other",
-		UpdatedAt: time.Unix(30, 0),
+		SessionID: "terminal-session",
+		CWD:       "/work",
+		UpdatedAt: time.Unix(20, 0),
+		LastKind:  domain.EventTurnComplete,
+	}}
+	processes := []domain.Process{
+		{PID: 1, Executable: "zsh"},
+		{PID: 2, PPID: 1, Executable: "node", Args: []string{"node", "/opt/bin/codex"}, CWD: "/work"},
+		{PID: 3, PPID: 2, Executable: "codex", Args: []string{"/opt/vendor/bin/codex"}, CWD: "/work"},
+	}
+
+	ss, err := p.DetectActive(context.Background(), sessions, processes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ss[0].Status != domain.StatusReady {
+		t.Fatalf("terminal-launched process should retain the cwd fallback: %#v", ss[0])
+	}
+}
+
+func TestDetectActiveMatchesAppServerWithOpenRollout(t *testing.T) {
+	sid := "12345678-1234-1234-1234-123456789abc"
+	p := &Plugin{o: Options{Executable: "codex"}}
+	sessions := []domain.Session{{
+		PluginID:  "codex",
+		AgentType: "codex",
+		SessionID: sid,
+		CWD:       "/work",
+		SourceRef: domain.SessionRef{Source: "/sessions/rollout-" + sid + ".jsonl"},
 		LastKind:  domain.EventUser,
-	}
-	ss, err := p.DetectActive(context.Background(), []domain.Session{old, newer, other}, []domain.Process{{
+	}}
+	processes := []domain.Process{{
 		Executable: "codex",
+		Args:       []string{"/opt/vendor/bin/codex", "app-server"},
+		OpenFiles:  []string{"/sessions/rollout-" + sid + ".jsonl"},
 		CWD:        "/work",
-	}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ss[0].Status != "" {
-		t.Fatalf("older same-cwd session should not be marked active: %#v", ss[0])
-	}
-	if ss[1].Status != domain.StatusReady {
-		t.Fatalf("latest same-cwd session should be active by cwd: %#v", ss[1])
-	}
-	if ss[2].Status != "" {
-		t.Fatalf("different cwd session should not be marked active: %#v", ss[2])
-	}
-}
+	}}
 
-func TestDetectActiveMatchesMultipleCodexProcessesByCWD(t *testing.T) {
-	p := &Plugin{o: Options{Executable: "codex"}}
-	old := domain.Session{PluginID: "codex", AgentType: "codex", SessionID: "old", CWD: "/work", UpdatedAt: time.Unix(10, 0), LastKind: domain.EventUser}
-	mid := domain.Session{PluginID: "codex", AgentType: "codex", SessionID: "mid", CWD: "/work", UpdatedAt: time.Unix(20, 0), LastKind: domain.EventToolCall}
-	newer := domain.Session{PluginID: "codex", AgentType: "codex", SessionID: "new", CWD: "/work", UpdatedAt: time.Unix(30, 0), LastKind: domain.EventTurnComplete}
-	ss, err := p.DetectActive(context.Background(), []domain.Session{old, mid, newer}, []domain.Process{
-		{Executable: "codex", CWD: "/work"},
-		{Executable: "codex", CWD: "/work"},
-	})
+	ss, err := p.DetectActive(context.Background(), sessions, processes)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ss[0].Status != "" {
-		t.Fatalf("oldest same-cwd session should remain inactive: %#v", ss[0])
-	}
-	if ss[1].Status != domain.StatusRunning {
-		t.Fatalf("second newest same-cwd session should be active: %#v", ss[1])
-	}
-	if ss[2].Status != domain.StatusReady {
-		t.Fatalf("newest same-cwd session should be active: %#v", ss[2])
-	}
-}
-
-func TestDetectActiveDeduplicatesCodexWrapperAndRuntimeProcessesByCWD(t *testing.T) {
-	p := &Plugin{o: Options{Executable: "codex"}}
-	old := domain.Session{PluginID: "codex", AgentType: "codex", SessionID: "old", CWD: "/work", UpdatedAt: time.Unix(10, 0), LastKind: domain.EventUser}
-	stale := domain.Session{PluginID: "codex", AgentType: "codex", SessionID: "stale", CWD: "/work", UpdatedAt: time.Unix(20, 0), LastKind: domain.EventUser}
-	activeA := domain.Session{PluginID: "codex", AgentType: "codex", SessionID: "active-a", CWD: "/work", UpdatedAt: time.Unix(30, 0), LastKind: domain.EventToolCall}
-	activeB := domain.Session{PluginID: "codex", AgentType: "codex", SessionID: "active-b", CWD: "/work", UpdatedAt: time.Unix(40, 0), LastKind: domain.EventTurnComplete}
-	ss, err := p.DetectActive(context.Background(), []domain.Session{old, stale, activeA, activeB}, []domain.Process{
-		{Executable: "node", Args: []string{"node", "/opt/bin/codex"}, CWD: "/work"},
-		{Executable: "codex", Args: []string{"/opt/lib/codex/vendor/bin/codex"}, CWD: "/work"},
-		{Executable: "node", Args: []string{"node", "/opt/bin/codex"}, CWD: "/work"},
-		{Executable: "codex", Args: []string{"/opt/lib/codex/vendor/bin/codex"}, CWD: "/work"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ss[0].Status != "" || ss[1].Status != "" {
-		t.Fatalf("wrapper/runtime pairs should count as two active sessions, not four: %#v", ss)
-	}
-	if ss[2].Status != domain.StatusRunning {
-		t.Fatalf("second newest same-cwd session should be active: %#v", ss[2])
-	}
-	if ss[3].Status != domain.StatusReady {
-		t.Fatalf("newest same-cwd session should be active: %#v", ss[3])
+	if ss[0].Status != domain.StatusRunning {
+		t.Fatalf("app-server with direct rollout evidence should remain active: %#v", ss[0])
 	}
 }
 
