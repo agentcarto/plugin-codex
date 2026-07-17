@@ -31,7 +31,9 @@ func (Factory) Descriptor() plugin.Descriptor {
 	// (agent-specific pseudo-prompt vocabulary moved out of core).
 	// ParserVersion=7: tool calls carry ToolArg and apply_patch/file_change
 	// events carry Changes (agent-specific rendering moved out of the host).
-	return plugin.Descriptor{Type: "codex", DisplayName: "Codex", ParserVersion: "7", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	// ParserVersion=8: a new task clears stale abort state before its first user
+	// message is classified, so mid-turn follow-ups cannot become session titles.
+	return plugin.Descriptor{Type: "codex", DisplayName: "Codex", ParserVersion: "8", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
@@ -146,6 +148,9 @@ func (s *codexParse) consume(o map[string]any) {
 		if common.String(p["type"]) == "task_started" {
 			s.flushCompacts()
 			s.turnHasItems = false
+			// Once Codex has started a new task, its first user message is the
+			// new turn's prompt rather than queued input for an older abort.
+			s.pendingAbortTurnID = ""
 		}
 		e = s.eventMsg(p, ts, turnID)
 	}

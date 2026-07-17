@@ -174,6 +174,34 @@ func TestLoadConversationKeepsSameCodexTurnIDTogether(t *testing.T) {
 		t.Fatalf("same turn_id events should stay in first turn with queued marker: events=%d queued=%d turns=%v", events, queued, turns)
 	}
 }
+
+func TestScanTitleIgnoresMidTurnUserMessages(t *testing.T) {
+	root := t.TempDir()
+	p := filepath.Join(root, "rollout-x-id.jsonl")
+	data := `{"timestamp":"2025-01-01T00:00:00Z","type":"session_meta","payload":{"id":"id","cwd":"/work"}}
+{"timestamp":"2025-01-01T00:00:01Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-0"}}
+{"timestamp":"2025-01-01T00:00:02Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}
+{"timestamp":"2025-01-01T00:00:03Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"# AGENTS.md instructions\n\n<INSTRUCTIONS>rules</INSTRUCTIONS>"},{"text":"<environment_context>cwd=/work</environment_context>"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-1"}}}
+{"timestamp":"2025-01-01T00:00:04Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"initial request"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-1"}}}
+{"timestamp":"2025-01-01T00:00:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"text":"working"}],"phase":"commentary","internal_chat_message_metadata_passthrough":{"turn_id":"turn-1"}}}
+{"timestamp":"2025-01-01T00:00:06Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"mid-turn clarification"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-1"}}}
+`
+	if err := os.WriteFile(p, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	pl := &Plugin{id: "codex", o: Options{SessionsDir: root}}
+	res, err := pl.Scan(context.Background(), plugin.ScanInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Sessions) != 1 {
+		t.Fatalf("sessions=%#v", res.Sessions)
+	}
+	if got := res.Sessions[0].Title; got != "initial request" {
+		t.Fatalf("title=%q, want initial request", got)
+	}
+}
+
 func TestLoadConversationQueuesUserAfterTurnAbort(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "rollout-x-id.jsonl")
 	data := `{"timestamp":"2025-01-01T00:00:00Z","type":"session_meta","payload":{"id":"id","cwd":"/work"}}
