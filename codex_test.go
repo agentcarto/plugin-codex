@@ -652,7 +652,7 @@ func TestDetectActiveMatchesRolloutUUIDFromOpenFile(t *testing.T) {
 	}
 }
 
-func TestDetectActiveIgnoresProcessesMatchedOnlyByCWD(t *testing.T) {
+func TestDetectActiveIgnoresAppServerProcessesMatchedOnlyByCWD(t *testing.T) {
 	p := &Plugin{o: Options{Executable: "codex"}}
 	sessions := []domain.Session{{
 		PluginID:  "codex",
@@ -664,13 +664,8 @@ func TestDetectActiveIgnoresProcessesMatchedOnlyByCWD(t *testing.T) {
 	}}
 	processes := []domain.Process{
 		{PID: 1, Executable: "phpstorm"},
-		// JetBrains launches a plain wrapper/runtime pair directly, without a shell ancestor.
-		{PID: 2, PPID: 1, Executable: "node", Args: []string{"node", "/opt/bin/codex"}, CWD: "/work"},
-		{PID: 3, PPID: 2, Executable: "codex", Args: []string{"/opt/vendor/bin/codex"}, CWD: "/work"},
-		{PID: 4, Executable: "zsh"},
-		// app-server is never a conversation, even when launched from a shell.
-		{PID: 5, PPID: 4, Executable: "node", Args: []string{"node", "/opt/node_modules/@openai/codex/bin/codex.js", "app-server"}, CWD: "/work"},
-		{PID: 6, PPID: 5, Executable: "codex", Args: []string{"/opt/vendor/bin/codex", "app-server"}, CWD: "/work"},
+		{PID: 2, PPID: 1, Executable: "node", Args: []string{"node", "/opt/node_modules/@openai/codex/bin/codex.js", "app-server"}, CWD: "/work"},
+		{PID: 3, PPID: 2, Executable: "codex", Args: []string{"/opt/vendor/bin/codex", "app-server"}, CWD: "/work"},
 	}
 
 	ss, err := p.DetectActive(context.Background(), sessions, processes)
@@ -679,6 +674,33 @@ func TestDetectActiveIgnoresProcessesMatchedOnlyByCWD(t *testing.T) {
 	}
 	if ss[0].Status != "" {
 		t.Fatalf("processes without direct session evidence should not mark a same-cwd session active: %#v", ss[0])
+	}
+}
+
+func TestDetectActiveFallsBackToCWDForIDEIntegratedTerminal(t *testing.T) {
+	p := &Plugin{o: Options{Executable: "codex"}}
+	sessions := []domain.Session{{
+		PluginID:  "codex",
+		AgentType: "codex",
+		SessionID: "ide-terminal-session",
+		CWD:       "/work",
+		UpdatedAt: time.Unix(20, 0),
+		LastKind:  domain.EventTurnComplete,
+	}}
+	processes := []domain.Process{
+		{PID: 1, Executable: "phpstorm"},
+		// JetBrains can launch a terminal command directly, without retaining the
+		// shell as an ancestor of the Codex wrapper/runtime pair.
+		{PID: 2, PPID: 1, Executable: "node", Args: []string{"node", "/opt/bin/codex"}, CWD: "/work"},
+		{PID: 3, PPID: 2, Executable: "codex", Args: []string{"/opt/vendor/bin/codex"}, CWD: "/work"},
+	}
+
+	ss, err := p.DetectActive(context.Background(), sessions, processes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ss[0].Status != domain.StatusReady {
+		t.Fatalf("IDE integrated terminal should retain the cwd fallback: %#v", ss[0])
 	}
 }
 
