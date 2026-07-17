@@ -33,7 +33,10 @@ func (Factory) Descriptor() plugin.Descriptor {
 	// events carry Changes (agent-specific rendering moved out of the host).
 	// ParserVersion=8: a new task clears stale abort state before its first user
 	// message is classified, so mid-turn follow-ups cannot become session titles.
-	return plugin.Descriptor{Type: "codex", DisplayName: "Codex", ParserVersion: "8", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	// ParserVersion=9: rollout identity stays tied to its leading metadata;
+	// internal subagents are excluded from the catalog while their final answers
+	// become task events on the parent turn.
+	return plugin.Descriptor{Type: "codex", DisplayName: "Codex", ParserVersion: "9", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
@@ -65,6 +68,10 @@ type codexParse struct {
 	curModel string
 	parent   string
 	start    time.Time
+	// seenSessionMeta keeps rollout identity tied to the leading metadata. A
+	// subagent rollout can contain a second session_meta copied from its parent.
+	seenSessionMeta  bool
+	internalSubagent bool
 	// seenUserTurn tracks turn IDs whose first user message has already been
 	// emitted, so later messages on the same turn are marked queued.
 	seenUserTurn map[string]bool
@@ -82,6 +89,11 @@ type codexParse struct {
 }
 
 func parse(ctx context.Context, path string) ([]domain.Event, string, string, string, string, time.Time) {
+	s := parseRollout(ctx, path)
+	return s.events, s.cwd, s.id, s.model, s.parent, s.start
+}
+
+func parseRollout(ctx context.Context, path string) *codexParse {
 	s := &codexParse{seenUserTurn: map[string]bool{}}
 	_ = common.JSONLines(ctx, path, func(_ int, o map[string]any) error {
 		s.consume(o)
@@ -92,7 +104,7 @@ func parse(ctx context.Context, path string) ([]domain.Event, string, string, st
 	if s.id == "" {
 		s.id = common.IDFromPath(path)
 	}
-	return s.events, s.cwd, s.id, s.model, s.parent, s.start
+	return s
 }
 
 // flushCompacts emits the compaction events deferred from the middle of a turn.
@@ -112,11 +124,18 @@ func (s *codexParse) consume(o map[string]any) {
 	p := common.Map(o["payload"])
 	switch typ {
 	case "session_meta":
-		s.id = common.String(p["id"])
-		s.cwd = common.String(p["cwd"])
-		s.model = common.String(p["model"])
-		s.curModel = s.model
-		s.parent = common.String(p["forked_from_id"])
+		m := common.String(p["model"])
+		if !s.seenSessionMeta {
+			s.seenSessionMeta = true
+			s.id = common.String(p["id"])
+			s.cwd = common.String(p["cwd"])
+			s.model = m
+			s.parent = common.String(p["forked_from_id"])
+			s.internalSubagent = common.String(p["thread_source"]) == "subagent"
+		}
+		if m != "" {
+			s.curModel = m
+		}
 		return
 	case "turn_context":
 		if s.cwd == "" {
@@ -168,6 +187,8 @@ func (s *codexParse) responseItem(p map[string]any, ts time.Time, turnID string)
 	switch pt {
 	case "message":
 		return s.message(p, ts, turnID)
+	case "agent_message":
+		return codexTaskEvent(p, ts, turnID)
 	case "reasoning":
 		text := common.Text(p["content"])
 		if text == "" {
@@ -197,6 +218,38 @@ func (s *codexParse) responseItem(p map[string]any, ts time.Time, turnID string)
 		return &domain.Event{Kind: domain.EventToolResult, Text: toolSearchResultText(p["tools"]), Timestamp: ts, RawType: pt, TurnID: turnID}
 	}
 	return nil
+}
+
+// codexTaskEvent converts a completed subagent message into the same normalized
+// task event Claude uses for its task notifications. Intermediate MESSAGE
+// updates are omitted so one subagent contributes one task to the turn count.
+func codexTaskEvent(p map[string]any, ts time.Time, turnID string) *domain.Event {
+	text := strings.ReplaceAll(common.Text(p["content"]), "\r\n", "\n")
+	header, body, ok := strings.Cut(text, "\nPayload:\n")
+	if !ok || !strings.HasPrefix(header, "Message Type: FINAL_ANSWER\n") {
+		return nil
+	}
+
+	label := strings.Trim(common.String(p["author"]), "/")
+	if i := strings.LastIndex(label, "/"); i >= 0 {
+		label = label[i+1:]
+	}
+	if label == "" {
+		label = "????????"
+	}
+	body = strings.TrimSpace(body)
+	if body == "" {
+		body = "(no result body)"
+	}
+	return &domain.Event{
+		Kind:       domain.EventTask,
+		Text:       body,
+		Timestamp:  ts,
+		RawType:    "agent_message",
+		TurnID:     turnID,
+		ToolArg:    label + " [completed]",
+		ToolDetail: body,
+	}
 }
 
 // toolSearchResultText renders a tool_search_output "tools" list as one line per
@@ -421,7 +474,12 @@ func (p *Plugin) Scan(ctx context.Context, in plugin.ScanInput) (plugin.ScanOutp
 		if cache.Skip(f) {
 			continue
 		}
-		ev, cwd, id, m, parent, st := parse(ctx, f)
+		parsed := parseRollout(ctx, f)
+		if parsed.internalSubagent {
+			cache.Dead(f)
+			continue
+		}
+		ev, cwd, id, m, parent, st := parsed.events, parsed.cwd, parsed.id, parsed.model, parsed.parent, parsed.start
 		if len(ev) == 0 {
 			cache.Dead(f)
 			continue

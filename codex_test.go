@@ -466,6 +466,33 @@ func TestParseCodexToolSearch(t *testing.T) {
 	}
 }
 
+func TestParseCodexSubagentFinalAnswerAsTask(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "rollout-x-id.jsonl")
+	data := `{"timestamp":"2026-07-17T00:00:00Z","type":"session_meta","payload":{"id":"id","cwd":"/work"}}
+{"timestamp":"2026-07-17T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"review"}],"internal_chat_message_metadata_passthrough":{"turn_id":"T1"}}}
+{"timestamp":"2026-07-17T00:00:02Z","type":"response_item","payload":{"type":"agent_message","author":"/root/security_review","recipient":"/root","content":[{"type":"input_text","text":"Message Type: MESSAGE\nTask name: /root\nSender: /root/security_review\nPayload:\nprogress"}],"internal_chat_message_metadata_passthrough":{"turn_id":"T1"}}}
+{"timestamp":"2026-07-17T00:00:03Z","type":"response_item","payload":{"type":"agent_message","author":"/root/security_review","recipient":"/root","content":[{"type":"input_text","text":"Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/security_review\nPayload:\nOne issue found.\n\nDetails here."}],"internal_chat_message_metadata_passthrough":{"turn_id":"T1"}}}
+`
+	if err := os.WriteFile(p, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	events, _, _, _, _, _ := parse(context.Background(), p)
+	var tasks []domain.Event
+	for _, event := range events {
+		if event.Kind == domain.EventTask {
+			tasks = append(tasks, event)
+		}
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("want one completed task event, got %#v", events)
+	}
+	task := tasks[0]
+	if task.ToolArg != "security_review [completed]" || task.ToolDetail != "One issue found.\n\nDetails here." || task.TurnID != "T1" {
+		t.Fatalf("task=%#v", task)
+	}
+}
+
 func TestScanCodexForkParentMetadata(t *testing.T) {
 	root := t.TempDir()
 	day := filepath.Join(root, "2026", "06", "23")
@@ -487,6 +514,43 @@ func TestScanCodexForkParentMetadata(t *testing.T) {
 	ss := res.Sessions
 	if len(ss) != 1 || ss[0].ParentSessionID != "parent" {
 		t.Fatalf("sessions=%#v", ss)
+	}
+}
+
+func TestScanCodexSkipsInternalSubagent(t *testing.T) {
+	root := t.TempDir()
+	day := filepath.Join(root, "2026", "07", "17")
+	if err := os.MkdirAll(day, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	parentPath := filepath.Join(day, "rollout-2026-07-17T00-00-00-parent.jsonl")
+	parentData := `{"timestamp":"2026-07-17T00:00:00Z","type":"session_meta","payload":{"id":"parent","cwd":"/parent","model":"parent-model"}}
+{"timestamp":"2026-07-17T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"parent prompt"}]}}
+`
+	if err := os.WriteFile(parentPath, []byte(parentData), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	childPath := filepath.Join(day, "rollout-2026-07-17T00-01-00-child.jsonl")
+	childData := `{"timestamp":"2026-07-17T00:01:00Z","type":"session_meta","payload":{"id":"child","cwd":"/child","model":"child-model","forked_from_id":"parent","thread_source":"subagent"}}
+{"timestamp":"2026-07-17T00:00:00Z","type":"session_meta","payload":{"id":"parent","cwd":"/parent","model":"parent-model"}}
+{"timestamp":"2026-07-17T00:01:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"child prompt"}]}}
+`
+	if err := os.WriteFile(childPath, []byte(childData), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &Plugin{id: "codex", o: Options{SessionsDir: root}}
+	res, err := p.Scan(context.Background(), plugin.ScanInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Sessions) != 1 {
+		t.Fatalf("internal subagent should be excluded, got %#v", res.Sessions)
+	}
+	if res.Sessions[0].SessionID != "parent" {
+		t.Fatalf("parent session missing: %#v", res.Sessions)
 	}
 }
 
