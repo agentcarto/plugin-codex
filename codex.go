@@ -36,7 +36,10 @@ func (Factory) Descriptor() plugin.Descriptor {
 	// ParserVersion=9: rollout identity stays tied to its leading metadata;
 	// internal subagents are excluded from the catalog while their final answers
 	// become task events on the parent turn.
-	return plugin.Descriptor{Type: "codex", DisplayName: "Codex", ParserVersion: "9", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	// ParserVersion=10: LastKind reports the activity in progress (common.Ongoing) rather than
+	// the kind of the last record. A rollout item is written once its block is complete, so a
+	// reasoning item means the reasoning is over and the reply is already being written.
+	return plugin.Descriptor{Type: "codex", DisplayName: "Codex", ParserVersion: "10", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
@@ -490,7 +493,9 @@ func (p *Plugin) Scan(ctx context.Context, in plugin.ScanInput) (plugin.ScanOutp
 		if st.IsZero() {
 			st = common.FileTime(f)
 		}
-		s := domain.Session{PluginID: p.id, AgentType: "codex", SessionID: id, CWD: cwd, StartedAt: st, UpdatedAt: common.FileTime(f), Title: common.Title(ev, "(no title)"), Model: m, ParentSessionID: parent, SourceRef: domain.SessionRef{Source: f}, LastKind: common.LastMeaningful(ev)}
+		// A rollout item lands once its block is complete, so the tail names what has just ended,
+		// not what the session is doing (common.Ongoing).
+		s := domain.Session{PluginID: p.id, AgentType: "codex", SessionID: id, CWD: cwd, StartedAt: st, UpdatedAt: common.FileTime(f), Title: common.Title(ev, "(no title)"), Model: m, ParentSessionID: parent, SourceRef: domain.SessionRef{Source: f}, LastKind: common.Ongoing(common.LastMeaningful(ev))}
 		cache.Stamp(&s)
 		out = append(out, s)
 	}

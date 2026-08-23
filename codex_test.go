@@ -2,6 +2,7 @@ package codex
 
 import (
 	"context"
+	"fmt"
 	convlogic "github.com/agentcarto/core/conversation"
 	"github.com/agentcarto/core/domain"
 	"github.com/agentcarto/core/plugin"
@@ -913,5 +914,53 @@ func TestPlanForkPreservesLineFidelity(t *testing.T) {
 	}
 	if !strings.Contains(out, `"forked_from_id":"abc"`) {
 		t.Fatalf("session_meta not tagged:\n%s", out)
+	}
+}
+
+// A rollout item is written once its block is complete, so the tail names what has just ended.
+// LastKind must report what the session is doing instead: after a reasoning item the reply is
+// already being written, and after a tool result the model is thinking again.
+func TestScanLastKindIsOngoingActivity(t *testing.T) {
+	root := t.TempDir()
+	day := filepath.Join(root, "2026", "06", "23")
+	if err := os.MkdirAll(day, 0700); err != nil {
+		t.Fatal(err)
+	}
+	meta := `{"timestamp":"2026-06-23T00:00:00Z","type":"session_meta","payload":{"id":"%s","cwd":"/work"}}`
+	prompt := `{"timestamp":"2026-06-23T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"question"}]}}`
+	reasoning := `{"timestamp":"2026-06-23T00:00:02Z","type":"response_item","payload":{"type":"reasoning","summary":[{"text":"pondering"}]}}`
+	call := `{"timestamp":"2026-06-23T00:00:03Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{}"}}`
+	output := `{"timestamp":"2026-06-23T00:00:04Z","type":"response_item","payload":{"type":"function_call_output","output":"out"}}`
+	// An assistant message carries a synthetic turn_complete, which must stay put: a finished turn
+	// is not an activity.
+	reply := `{"timestamp":"2026-06-23T00:00:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"text":"answer"}]}}`
+	cases := map[string]struct {
+		lines []string
+		want  domain.EventKind
+	}{
+		"reasoning": {[]string{prompt, reasoning}, domain.EventStream},
+		"result":    {[]string{prompt, reasoning, call, output}, domain.EventReasoning},
+		"call":      {[]string{prompt, reasoning, call}, domain.EventToolCall},
+		"reply":     {[]string{prompt, reasoning, reply}, domain.EventTurnComplete},
+	}
+	for id, c := range cases {
+		data := fmt.Sprintf(meta, id) + "\n" + strings.Join(c.lines, "\n") + "\n"
+		if err := os.WriteFile(filepath.Join(day, "rollout-2026-06-23T00-00-00-"+id+".jsonl"), []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p := &Plugin{id: "codex", o: Options{SessionsDir: root}}
+	res, err := p.Scan(context.Background(), plugin.ScanInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]domain.EventKind{}
+	for _, s := range res.Sessions {
+		seen[s.SessionID] = s.LastKind
+	}
+	for id, c := range cases {
+		if seen[id] != c.want {
+			t.Errorf("%s: LastKind = %q, want %q", id, seen[id], c.want)
+		}
 	}
 }
