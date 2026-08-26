@@ -176,6 +176,116 @@ func TestLoadConversationKeepsSameCodexTurnIDTogether(t *testing.T) {
 	}
 }
 
+func TestLoadConversationHydratesPaginatedHistory(t *testing.T) {
+	root := t.TempDir()
+	parentPath := filepath.Join(root, "rollout-2026-08-25T00-00-00-parent.jsonl")
+	parent := `{"timestamp":"2026-08-25T00:00:00Z","ordinal":1,"type":"session_meta","payload":{"id":"parent","cwd":"/work","history_mode":"paginated","history_base":null}}
+{"timestamp":"2026-08-25T00:00:01Z","ordinal":2,"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"root prompt"}]}}
+{"timestamp":"2026-08-25T00:00:02Z","ordinal":3,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"text":"root answer"}]}}
+{"timestamp":"2026-08-25T00:00:03Z","ordinal":4,"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"parent continuation"}]}}
+{"timestamp":"2026-08-25T00:00:04Z","type":"event_msg","payload":{"type":"legacy_record_after_boundary"}}
+`
+	if err := os.WriteFile(parentPath, []byte(parent), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	childPath := filepath.Join(root, "rollout-2026-08-25T00-01-00-child.jsonl")
+	child := `{"timestamp":"2026-08-25T00:01:00Z","ordinal":4,"type":"session_meta","payload":{"id":"child","cwd":"/work","forked_from_id":"parent","history_mode":"paginated","history_base":{"thread_id":"parent","end_ordinal_exclusive":4,"end_byte_offset":123}}}
+{"timestamp":"2026-08-25T00:01:01Z","ordinal":5,"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"child prompt"}]}}
+`
+	if err := os.WriteFile(childPath, []byte(child), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &Plugin{o: Options{SessionsDir: root}}
+	c, err := p.LoadConversation(context.Background(), domain.SessionRef{Source: childPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(conversationUserTexts(*c), ","); got != "root prompt,child prompt" {
+		t.Fatalf("users=%q, want inherited prefix and child suffix", got)
+	}
+}
+
+func TestLoadConversationHydratesNestedPaginatedHistoryAtEachBoundary(t *testing.T) {
+	root := t.TempDir()
+	files := map[string]string{
+		"rollout-2026-08-25T00-00-00-root.jsonl": `{"timestamp":"2026-08-25T00:00:00Z","ordinal":1,"type":"session_meta","payload":{"id":"root","cwd":"/work","history_mode":"paginated","history_base":null}}
+{"timestamp":"2026-08-25T00:00:01Z","ordinal":2,"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"root prompt"}]}}
+`,
+		"rollout-2026-08-25T00-01-00-child.jsonl": `{"timestamp":"2026-08-25T00:01:00Z","ordinal":3,"type":"session_meta","payload":{"id":"child","cwd":"/work","forked_from_id":"root","history_mode":"paginated","history_base":{"thread_id":"root","end_ordinal_exclusive":3,"end_byte_offset":123}}}
+{"timestamp":"2026-08-25T00:01:01Z","ordinal":4,"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"child-only prompt"}]}}
+`,
+		"rollout-2026-08-25T00-02-00-grandchild.jsonl": `{"timestamp":"2026-08-25T00:02:00Z","ordinal":4,"type":"session_meta","payload":{"id":"grandchild","cwd":"/work","forked_from_id":"child","history_mode":"paginated","history_base":{"thread_id":"child","end_ordinal_exclusive":4,"end_byte_offset":456}}}
+{"timestamp":"2026-08-25T00:02:01Z","ordinal":5,"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"grandchild prompt"}]}}
+`,
+	}
+	for name, data := range files {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	p := &Plugin{o: Options{SessionsDir: root}}
+	c, err := p.LoadConversation(context.Background(), domain.SessionRef{Source: filepath.Join(root, "rollout-2026-08-25T00-02-00-grandchild.jsonl")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(conversationUserTexts(*c), ","); got != "root prompt,grandchild prompt" {
+		t.Fatalf("users=%q, want each inherited segment truncated at its own boundary", got)
+	}
+}
+
+func TestLoadConversationRejectsMissingPaginatedHistory(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "rollout-2026-08-25T00-01-00-child.jsonl")
+	data := `{"timestamp":"2026-08-25T00:01:00Z","ordinal":2,"type":"session_meta","payload":{"id":"child","cwd":"/work","history_mode":"paginated","history_base":{"thread_id":"missing","end_ordinal_exclusive":2,"end_byte_offset":123}}}
+{"timestamp":"2026-08-25T00:01:01Z","ordinal":3,"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"child prompt"}]}}
+`
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &Plugin{o: Options{SessionsDir: root}}
+	_, err := p.LoadConversation(context.Background(), domain.SessionRef{Source: path})
+	if err == nil || !strings.Contains(err.Error(), "missing") {
+		t.Fatalf("err=%v, want missing history error", err)
+	}
+}
+
+func TestLoadConversationRejectsPaginatedHistoryCycle(t *testing.T) {
+	root := t.TempDir()
+	files := map[string]string{
+		"rollout-2026-08-25T00-00-00-a.jsonl": `{"timestamp":"2026-08-25T00:00:00Z","ordinal":1,"type":"session_meta","payload":{"id":"a","cwd":"/work","history_mode":"paginated","history_base":{"thread_id":"b","end_ordinal_exclusive":1,"end_byte_offset":1}}}
+`,
+		"rollout-2026-08-25T00-00-01-b.jsonl": `{"timestamp":"2026-08-25T00:00:01Z","ordinal":1,"type":"session_meta","payload":{"id":"b","cwd":"/work","history_mode":"paginated","history_base":{"thread_id":"a","end_ordinal_exclusive":1,"end_byte_offset":1}}}
+`,
+	}
+	for name, data := range files {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	p := &Plugin{o: Options{SessionsDir: root}}
+	_, err := p.LoadConversation(context.Background(), domain.SessionRef{Source: filepath.Join(root, "rollout-2026-08-25T00-00-00-a.jsonl")})
+	if err == nil || !strings.Contains(err.Error(), "cycle") {
+		t.Fatalf("err=%v, want history cycle error", err)
+	}
+}
+
+func conversationUserTexts(c domain.Conversation) []string {
+	var texts []string
+	for _, id := range c.ActivePath() {
+		for _, event := range c.Nodes[id].Events {
+			if event.Kind == domain.EventUser {
+				texts = append(texts, event.Text)
+			}
+		}
+	}
+	return texts
+}
+
 func TestScanTitleIgnoresMidTurnUserMessages(t *testing.T) {
 	root := t.TempDir()
 	p := filepath.Join(root, "rollout-x-id.jsonl")

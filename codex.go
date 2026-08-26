@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -39,7 +40,9 @@ func (Factory) Descriptor() plugin.Descriptor {
 	// ParserVersion=10: LastKind reports the activity in progress (common.Ongoing) rather than
 	// the kind of the last record. A rollout item is written once its block is complete, so a
 	// reasoning item means the reasoning is over and the reply is already being written.
-	return plugin.Descriptor{Type: "codex", DisplayName: "Codex", ParserVersion: "10", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	// ParserVersion=11: conversations hydrate the inherited prefix referenced by
+	// paginated history_base metadata before parsing a fork's local suffix.
+	return plugin.Descriptor{Type: "codex", DisplayName: "Codex", ParserVersion: "11", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
@@ -108,6 +111,136 @@ func parseRollout(ctx context.Context, path string) *codexParse {
 		s.id = common.IDFromPath(path)
 	}
 	return s
+}
+
+type paginatedHistoryBase struct {
+	threadID            string
+	endOrdinalExclusive int64
+}
+
+type conversationRolloutLoader struct {
+	root     string
+	files    []string
+	visiting map[string]bool
+}
+
+var errPaginatedHistoryBoundary = errors.New("Codex paginated history boundary reached")
+
+func (p *Plugin) parseConversationRollout(ctx context.Context, path string) (*codexParse, error) {
+	root := p.o.SessionsDir
+	if root == "" {
+		root = filepath.Dir(path)
+	}
+	loader := conversationRolloutLoader{root: root, visiting: map[string]bool{}}
+	s := &codexParse{seenUserTurn: map[string]bool{}}
+	if err := loader.consume(ctx, path, nil, s); err != nil {
+		return nil, err
+	}
+	s.flushCompacts()
+	annotateTools(s.events)
+	if s.id == "" {
+		s.id = common.IDFromPath(path)
+	}
+	return s, nil
+}
+
+func (l *conversationRolloutLoader) consume(ctx context.Context, path string, endOrdinalExclusive *int64, s *codexParse) error {
+	path = filepath.Clean(path)
+	if l.visiting[path] {
+		return fmt.Errorf("Codex paginated history cycle at %s", path)
+	}
+	l.visiting[path] = true
+	defer delete(l.visiting, path)
+
+	seenSessionMeta := false
+	err := common.JSONLines(ctx, path, func(_ int, record map[string]any) error {
+		if !seenSessionMeta && common.String(record["type"]) == "session_meta" {
+			seenSessionMeta = true
+			base, err := historyBase(record)
+			if err != nil {
+				return fmt.Errorf("read Codex paginated history metadata from %s: %w", path, err)
+			}
+			if base != nil {
+				basePath, err := l.resolve(base.threadID)
+				if err != nil {
+					return err
+				}
+				if err := l.consume(ctx, basePath, &base.endOrdinalExclusive, s); err != nil {
+					return err
+				}
+			}
+		}
+
+		if endOrdinalExclusive != nil {
+			ordinal, ok := recordOrdinal(record)
+			if !ok {
+				return fmt.Errorf("Codex paginated history record in %s has no integer ordinal", path)
+			}
+			if ordinal >= *endOrdinalExclusive {
+				return errPaginatedHistoryBoundary
+			}
+		}
+		s.consume(record)
+		return nil
+	})
+	if errors.Is(err, errPaginatedHistoryBoundary) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("load Codex rollout %s: %w", path, err)
+	}
+	return nil
+}
+
+func historyBase(record map[string]any) (*paginatedHistoryBase, error) {
+	payload := common.Map(record["payload"])
+	if common.String(payload["history_mode"]) != "paginated" {
+		return nil, nil
+	}
+	if payload["history_base"] == nil {
+		return nil, nil
+	}
+	base := common.Map(payload["history_base"])
+	threadID := common.String(base["thread_id"])
+	end, ok := recordOrdinal(map[string]any{"ordinal": base["end_ordinal_exclusive"]})
+	if threadID == "" || !ok {
+		return nil, fmt.Errorf("history_base requires thread_id and integer end_ordinal_exclusive")
+	}
+	return &paginatedHistoryBase{threadID: threadID, endOrdinalExclusive: end}, nil
+}
+
+func recordOrdinal(record map[string]any) (int64, bool) {
+	n, ok := record["ordinal"].(float64)
+	if !ok {
+		return 0, false
+	}
+	i := int64(n)
+	return i, float64(i) == n
+}
+
+func (l *conversationRolloutLoader) resolve(threadID string) (string, error) {
+	if l.files == nil {
+		files, err := common.WalkFiles(l.root, isRolloutFile)
+		if err != nil {
+			return "", fmt.Errorf("scan Codex sessions for paginated history: %w", err)
+		}
+		l.files = files
+	}
+	suffix := "-" + threadID + ".jsonl"
+	match := ""
+	for _, path := range l.files {
+		if !strings.HasSuffix(filepath.Base(path), suffix) {
+			continue
+		}
+		if match != "" {
+			return "", fmt.Errorf("multiple Codex paginated history rollouts found for thread %s", threadID)
+		}
+		match = path
+	}
+	if match == "" {
+		return "", fmt.Errorf("Codex paginated history rollout for thread %s is missing under %s", threadID, l.root)
+	}
+	return match, nil
 }
 
 // flushCompacts emits the compaction events deferred from the middle of a turn.
@@ -508,7 +641,11 @@ func isRolloutFile(path string) bool {
 }
 
 func (p *Plugin) LoadConversation(ctx context.Context, r domain.SessionRef) (*domain.Conversation, error) {
-	ev, _, _, _, _, _ := parse(ctx, r.Source)
+	parsed, err := p.parseConversationRollout(ctx, r.Source)
+	if err != nil {
+		return nil, err
+	}
+	ev := parsed.events
 	ev = withoutSyntheticStatus(ev)
 	c := rollbackConversation(ev, "thread_rolled_back")
 	return &c, nil
