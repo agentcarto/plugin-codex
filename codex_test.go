@@ -788,6 +788,31 @@ func TestDetectActiveIgnoresAppServerProcessesMatchedOnlyByCWD(t *testing.T) {
 	}
 }
 
+func TestDetectActiveIgnoresEphemeralProcessesMatchedOnlyByCWD(t *testing.T) {
+	p := &Plugin{o: Options{Executable: "codex"}}
+	sessions := []domain.Session{{
+		PluginID:  "codex",
+		AgentType: "codex",
+		SessionID: "completed",
+		CWD:       "/work",
+		UpdatedAt: time.Unix(20, 0),
+		LastKind:  domain.EventTurnComplete,
+	}}
+	processes := []domain.Process{
+		{PID: 1, Executable: "agentcarto", CWD: "/work"},
+		{PID: 2, PPID: 1, Executable: "node", Args: []string{"node", "/opt/bin/codex", "exec", "--ephemeral"}, CWD: "/work"},
+		{PID: 3, PPID: 2, Executable: "codex", Args: []string{"/opt/vendor/bin/codex", "exec", "--ephemeral"}, CWD: "/work"},
+	}
+
+	ss, err := p.DetectActive(context.Background(), sessions, processes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ss[0].Status != "" {
+		t.Fatalf("ephemeral processes should not mark a same-cwd persisted session active: %#v", ss[0])
+	}
+}
+
 func TestDetectActiveFallsBackToCWDForIDEIntegratedTerminal(t *testing.T) {
 	p := &Plugin{o: Options{Executable: "codex"}}
 	sessions := []domain.Session{{

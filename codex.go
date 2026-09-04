@@ -773,10 +773,10 @@ func (p *Plugin) DetectActive(ctx context.Context, ss []domain.Session, ps []dom
 
 // countCodexProcessesByCWD marks sessions that match a process exactly and, for
 // unmatched interactive Codex processes, counts how many run in each cwd. IDE
-// ACP app-server processes are excluded explicitly; an IDE integrated terminal
-// can launch an interactive process without leaving a shell in its ancestry. A
-// direct runtime and its wrapper share a cwd, so direct counts replace wrapper
-// counts there.
+// ACP app-server and ephemeral processes are excluded explicitly because neither
+// owns a persisted session; an IDE integrated terminal can launch an interactive
+// process without leaving a shell in its ancestry. A direct runtime and its
+// wrapper share a cwd, so direct counts replace wrapper counts there.
 func (p *Plugin) countCodexProcessesByCWD(ss []domain.Session, ps []domain.Process, matched map[string]bool) map[string]int {
 	directCWDCounts := map[string]int{}
 	wrapperCWDCounts := map[string]int{}
@@ -788,7 +788,7 @@ func (p *Plugin) countCodexProcessesByCWD(ss []domain.Session, ps []domain.Proce
 				exact = true
 			}
 		}
-		if !p.isCodexProcess(pr) || isCodexAppServerProcess(pr) {
+		if !p.isCodexProcess(pr) || isCodexCWDMatchExcluded(pr) {
 			continue
 		}
 		if pr.CWD != "" && !exact {
@@ -863,10 +863,12 @@ func (p *Plugin) isCodexDirectProcess(pr domain.Process) bool {
 	return matchesExecName(pr.Executable, p.executableName())
 }
 
-// isCodexAppServerProcess detects the long-lived server mode used by IDE ACP integrations.
-func isCodexAppServerProcess(pr domain.Process) bool {
+// isCodexCWDMatchExcluded reports processes that cannot be associated with a
+// persisted session by working directory alone. Exact rollout evidence is
+// checked before this: app-server can still own a session it has opened.
+func isCodexCWDMatchExcluded(pr domain.Process) bool {
 	for _, arg := range pr.Args {
-		if arg == "app-server" {
+		if arg == "app-server" || arg == "--ephemeral" {
 			return true
 		}
 	}
