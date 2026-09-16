@@ -45,7 +45,8 @@ func (Factory) Descriptor() plugin.Descriptor {
 	// paginated history_base metadata before parsing a fork's local suffix.
 	// ParserVersion=12: guardian reviews are displayed inside their parent and
 	// invalidate its cached conversation when the review log changes.
-	return plugin.Descriptor{Type: "codex", DisplayName: "Codex", ParserVersion: "12", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	// ParserVersion=14: guardian decision labels are rendered in English.
+	return plugin.Descriptor{Type: "codex", DisplayName: "Codex", ParserVersion: "14", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {

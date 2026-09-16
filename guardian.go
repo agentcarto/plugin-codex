@@ -136,17 +136,47 @@ func readGuardianReviews(ctx context.Context, m rolloutMeta) ([]guardianReview, 
 					RawType: "guardian_review", ToolArg: "Auto review [pending]", ToolDetail: body, Text: body}})
 		} else if e.Kind == domain.EventAssistant && len(out) > 0 {
 			r := &out[len(out)-1]
-			var result struct {
-				Outcome string `json:"outcome"`
-			}
-			status := "unknown"
-			if json.Unmarshal([]byte(e.Text), &result) == nil && (result.Outcome == "allow" || result.Outcome == "deny") {
-				status = result.Outcome
-			}
+			status, report := formatGuardianResult(e.Text)
 			r.event.ToolArg = "Auto review [" + status + "]"
-			r.event.ToolDetail += "\n" + e.Text
+			r.event.ToolDetail = report + "\n\n" + r.event.ToolDetail
 			r.event.Text, r.event.Model = r.event.ToolDetail, e.Model
 		}
 	}
 	return out, nil
+}
+
+func formatGuardianResult(text string) (string, string) {
+	var result map[string]string
+	if err := json.Unmarshal([]byte(text), &result); err != nil {
+		return "unknown", text
+	}
+	outcome := result["outcome"]
+	decision := map[string]string{"allow": "Allowed", "deny": "Denied"}[outcome]
+	if decision == "" {
+		return "unknown", text
+	}
+	// Preserve new fields verbatim until their meaning and display are known.
+	for key := range result {
+		switch key {
+		case "outcome", "risk_level", "user_authorization", "rationale":
+		default:
+			return outcome, text
+		}
+	}
+	lines := []string{"Decision: " + decision + " (" + outcome + ")"}
+	for _, field := range []struct{ key, label string }{
+		{"risk_level", "Risk"}, {"user_authorization", "User authorization"},
+	} {
+		if value := result[field.key]; value != "" {
+			label := map[string]string{"low": "Low", "medium": "Medium", "high": "High", "unknown": "Unknown"}[value]
+			if label != "" {
+				value = label + " (" + value + ")"
+			}
+			lines = append(lines, field.label+": "+value)
+		}
+	}
+	if rationale := result["rationale"]; rationale != "" {
+		lines = append(lines, "", "Rationale:", rationale)
+	}
+	return outcome, strings.Join(lines, "\n")
 }

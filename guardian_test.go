@@ -83,3 +83,25 @@ func TestGuardianIndexAndDependencies(t *testing.T) {
 		t.Fatal("read failure hidden")
 	}
 }
+
+func TestFormatGuardianResult(t *testing.T) {
+	input := `{"risk_level":"low","user_authorization":"high","outcome":"allow","rationale":"ローカルテストとビルド。\n外部送信なし。"}`
+	status, got := formatGuardianResult(input)
+	want := "Decision: Allowed (allow)\nRisk: Low (low)\nUser authorization: High (high)\n\nRationale:\nローカルテストとビルド。\n外部送信なし。"
+	if status != "allow" || got != want {
+		t.Fatalf("status=%q report=%q", status, got)
+	}
+	status, got = formatGuardianResult(`{"outcome":"deny"}`)
+	if status != "deny" || got != "Decision: Denied (deny)" {
+		t.Fatalf("partial decision: %q %q", status, got)
+	}
+	for _, raw := range []string{
+		`not JSON`, `null`, `{"outcome":"defer"}`, `{"outcome":"allow","new_field":"keep me"}`,
+		`{"outcome":"allow","risk_level":42}`,
+	} {
+		_, got := formatGuardianResult(raw)
+		if got != raw {
+			t.Fatalf("unknown data lost: %q -> %q", raw, got)
+		}
+	}
+}
