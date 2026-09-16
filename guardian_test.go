@@ -87,12 +87,12 @@ func TestGuardianIndexAndDependencies(t *testing.T) {
 func TestFormatGuardianResult(t *testing.T) {
 	input := `{"risk_level":"low","user_authorization":"high","outcome":"allow","rationale":"ローカルテストとビルド。\n外部送信なし。"}`
 	status, got := formatGuardianResult(input)
-	want := "Decision: Allowed (allow)\nRisk: Low (low)\nUser authorization: High (high)\n\nRationale:\nローカルテストとビルド。\n外部送信なし。"
+	want := "Decision: Allowed\nRisk: Low\nUser authorization: High\n\nRationale:\nローカルテストとビルド。\n外部送信なし。"
 	if status != "allow" || got != want {
 		t.Fatalf("status=%q report=%q", status, got)
 	}
 	status, got = formatGuardianResult(`{"outcome":"deny"}`)
-	if status != "deny" || got != "Decision: Denied (deny)" {
+	if status != "deny" || got != "Decision: Denied" {
 		t.Fatalf("partial decision: %q %q", status, got)
 	}
 	for _, raw := range []string{

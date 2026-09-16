@@ -163,14 +163,14 @@ func formatGuardianResult(text string) (string, string) {
 			return outcome, text
 		}
 	}
-	lines := []string{"Decision: " + decision + " (" + outcome + ")"}
+	lines := []string{"Decision: " + decision}
 	for _, field := range []struct{ key, label string }{
 		{"risk_level", "Risk"}, {"user_authorization", "User authorization"},
 	} {
 		if value := result[field.key]; value != "" {
 			label := map[string]string{"low": "Low", "medium": "Medium", "high": "High", "unknown": "Unknown"}[value]
 			if label != "" {
-				value = label + " (" + value + ")"
+				value = label
 			}
 			lines = append(lines, field.label+": "+value)
 		}
