@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/agentcarto/core/common"
@@ -42,7 +43,9 @@ func (Factory) Descriptor() plugin.Descriptor {
 	// reasoning item means the reasoning is over and the reply is already being written.
 	// ParserVersion=11: conversations hydrate the inherited prefix referenced by
 	// paginated history_base metadata before parsing a fork's local suffix.
-	return plugin.Descriptor{Type: "codex", DisplayName: "Codex", ParserVersion: "11", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	// ParserVersion=12: guardian reviews are displayed inside their parent and
+	// invalidate its cached conversation when the review log changes.
+	return plugin.Descriptor{Type: "codex", DisplayName: "Codex", ParserVersion: "12", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
@@ -51,12 +54,14 @@ func (Factory) New(id string, n *yaml.Node) (any, error) {
 		return nil, e
 	}
 	o.SessionsDir = common.ExpandHome(o.SessionsDir)
-	return &Plugin{id, o}, nil
+	return &Plugin{id: id, o: o}, nil
 }
 
 type Plugin struct {
-	id string
-	o  Options
+	id        string
+	o         Options
+	indexMu   sync.RWMutex
+	guardians *guardianIndex
 }
 
 func (p *Plugin) Executable() string { return p.o.Executable }
@@ -601,13 +606,18 @@ func (p *Plugin) Scan(ctx context.Context, in plugin.ScanInput) (plugin.ScanOutp
 	if e != nil {
 		return plugin.ScanOutput{}, e
 	}
+	idx, e := indexGuardians(ctx, fs)
+	if e != nil {
+		return plugin.ScanOutput{}, e
+	}
 	var out []domain.Session
 	for _, f := range fs {
-		if s, ok := cache.Reuse(f); ok {
+		fp, updated := idx.fingerprint(f)
+		if s, ok := cache.ReuseWithFingerprint(f, fp); ok {
 			out = append(out, s)
 			continue
 		}
-		if cache.Skip(f) {
+		if idx.files[f].source != "guardian_review" && cache.Skip(f) {
 			continue
 		}
 		parsed := parseRollout(ctx, f)
@@ -629,9 +639,34 @@ func (p *Plugin) Scan(ctx context.Context, in plugin.ScanInput) (plugin.ScanOutp
 		// A rollout item lands once its block is complete, so the tail names what has just ended,
 		// not what the session is doing (common.Ongoing).
 		s := domain.Session{PluginID: p.id, AgentType: "codex", SessionID: id, CWD: cwd, StartedAt: st, UpdatedAt: common.FileTime(f), Title: common.Title(ev, "(no title)"), Model: m, ParentSessionID: parent, SourceRef: domain.SessionRef{Source: f}, LastKind: common.Ongoing(common.LastMeaningful(ev))}
-		cache.Stamp(&s)
+		s.UpdatedAt = updated
+		s.Unresumable = idx.files[f].source == "guardian_review"
+		cache.StampWithFingerprint(&s, fp)
 		out = append(out, s)
 	}
+	if !in.IncludeInternal {
+		parents := map[string]bool{}
+		for _, s := range out {
+			m := idx.files[s.SourceRef.Source]
+			if m.source != "guardian_review" && len(idx.reviews[s.SessionID]) > 0 && idx.byID[s.SessionID] == s.SourceRef.Source {
+				_, err := p.parseConversationRollout(ctx, s.SourceRef.Source)
+				parents[s.SessionID] = err == nil
+			}
+		}
+		visible := out[:0]
+		for _, s := range out {
+			m := idx.files[s.SourceRef.Source]
+			if m.source == "guardian_review" && parents[m.parent] {
+				cache.Dead(s.SourceRef.Source)
+				continue
+			}
+			visible = append(visible, s)
+		}
+		out = visible
+	}
+	p.indexMu.Lock()
+	p.guardians = idx
+	p.indexMu.Unlock()
 	return plugin.ScanOutput{Sessions: out, Dead: cache.DeadOut()}, nil
 }
 
@@ -648,6 +683,9 @@ func (p *Plugin) LoadConversation(ctx context.Context, r domain.SessionRef) (*do
 	ev := parsed.events
 	ev = withoutSyntheticStatus(ev)
 	c := rollbackConversation(ev, "thread_rolled_back")
+	if err := p.loadGuardianEvents(ctx, r.Source, &c); err != nil {
+		return nil, err
+	}
 	return &c, nil
 }
 
