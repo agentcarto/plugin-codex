@@ -1090,16 +1090,23 @@ func TestScanLastKindIsOngoingActivity(t *testing.T) {
 	reply := `{"timestamp":"2026-06-23T00:00:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"text":"answer"}]}}`
 	// An interrupt ends the turn without a reply; Codex is idle again afterwards.
 	aborted := `{"timestamp":"2026-06-23T00:00:05Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"T1","reason":"interrupted"}}`
+	// A compaction in the middle of a turn is kept until the turn's output is done, so in a
+	// finished log it comes after the reply; it is not an activity either.
+	started := `{"timestamp":"2026-06-23T00:00:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"T1"}}`
+	compacted := `{"timestamp":"2026-06-23T00:00:04Z","type":"compacted","payload":{"message":"","replacement_history":[]}}`
+	completed := `{"timestamp":"2026-06-23T00:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"T1"}}`
 	cases := map[string]struct {
 		lines []string
 		want  domain.EventKind
 	}{
-		"reasoning":                {[]string{prompt, reasoning}, domain.EventStream},
-		"result":                   {[]string{prompt, reasoning, call, output}, domain.EventReasoning},
-		"call":                     {[]string{prompt, reasoning, call}, domain.EventToolCall},
-		"reply":                    {[]string{prompt, reasoning, reply}, domain.EventTurnComplete},
-		"interrupted":              {[]string{prompt, reasoning, call, aborted}, domain.EventTurnComplete},
-		"interrupted-before-reply": {[]string{prompt, aborted}, domain.EventTurnComplete},
+		"reasoning":                  {[]string{prompt, reasoning}, domain.EventStream},
+		"result":                     {[]string{prompt, reasoning, call, output}, domain.EventReasoning},
+		"call":                       {[]string{prompt, reasoning, call}, domain.EventToolCall},
+		"reply":                      {[]string{prompt, reasoning, reply}, domain.EventTurnComplete},
+		"interrupted":                {[]string{prompt, reasoning, call, aborted}, domain.EventTurnComplete},
+		"interrupted-before-reply":   {[]string{prompt, aborted}, domain.EventTurnComplete},
+		"compacted-mid-turn":         {[]string{started, prompt, call, compacted, reply, completed}, domain.EventTurnComplete},
+		"compacted-mid-turn-running": {[]string{started, prompt, call, compacted, call}, domain.EventToolCall},
 	}
 	for id, c := range cases {
 		data := fmt.Sprintf(meta, id) + "\n" + strings.Join(c.lines, "\n") + "\n"

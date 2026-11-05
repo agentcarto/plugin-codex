@@ -49,7 +49,9 @@ func (Factory) Descriptor() plugin.Descriptor {
 	// ParserVersion=15: task_complete ends the turn, so LastKind of a turn stopped by an
 	// error is no longer the last tool result; cached sessions must be parsed again.
 	// ParserVersion=16: turn_aborted (an interrupt) ends the turn the same way.
-	return plugin.Descriptor{Type: "codex", DisplayName: "Codex", ParserVersion: "16", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	// ParserVersion=17: LastKind skips compaction summaries, which a mid-turn compaction
+	// leaves after the turn's end.
+	return plugin.Descriptor{Type: "codex", DisplayName: "Codex", ParserVersion: "17", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
@@ -649,7 +651,7 @@ func (p *Plugin) Scan(ctx context.Context, in plugin.ScanInput) (plugin.ScanOutp
 		}
 		// A rollout item lands once its block is complete, so the tail names what has just ended,
 		// not what the session is doing (common.Ongoing).
-		s := domain.Session{PluginID: p.id, AgentType: "codex", SessionID: id, CWD: cwd, StartedAt: st, UpdatedAt: common.FileTime(f), Title: common.Title(ev, "(no title)"), Model: m, ParentSessionID: parent, SourceRef: domain.SessionRef{Source: f}, LastKind: common.Ongoing(common.LastMeaningful(ev))}
+		s := domain.Session{PluginID: p.id, AgentType: "codex", SessionID: id, CWD: cwd, StartedAt: st, UpdatedAt: common.FileTime(f), Title: common.Title(ev, "(no title)"), Model: m, ParentSessionID: parent, SourceRef: domain.SessionRef{Source: f}, LastKind: common.Ongoing(lastActivity(ev))}
 		s.UpdatedAt = updated
 		s.Unresumable = idx.files[f].source == "guardian_review"
 		cache.StampWithFingerprint(&s, fp)
@@ -679,6 +681,22 @@ func (p *Plugin) Scan(ctx context.Context, in plugin.ScanInput) (plugin.ScanOutp
 	p.guardians = idx
 	p.indexMu.Unlock()
 	return plugin.ScanOutput{Sessions: out, Dead: cache.DeadOut()}, nil
+}
+
+// lastActivity is common.LastMeaningful with compaction summaries skipped.
+// A mid-turn compaction is moved behind the rest of its turn (pendingCompacts),
+// so in a finished log it lands after the turn's end and, being a user-kind
+// event, would make an idle session read as one with a pending prompt.
+func lastActivity(ev []domain.Event) domain.EventKind {
+	for i := len(ev) - 1; i >= 0; i-- {
+		if ev[i].RawType == domain.RawCompactSummary {
+			continue
+		}
+		if k := common.LastMeaningful(ev[i : i+1]); k != "" {
+			return k
+		}
+	}
+	return ""
 }
 
 // isRolloutFile reports whether a path is a Codex rollout log.
