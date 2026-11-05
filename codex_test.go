@@ -1088,14 +1088,18 @@ func TestScanLastKindIsOngoingActivity(t *testing.T) {
 	// An assistant message carries a synthetic turn_complete, which must stay put: a finished turn
 	// is not an activity.
 	reply := `{"timestamp":"2026-06-23T00:00:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"text":"answer"}]}}`
+	// An interrupt ends the turn without a reply; Codex is idle again afterwards.
+	aborted := `{"timestamp":"2026-06-23T00:00:05Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"T1","reason":"interrupted"}}`
 	cases := map[string]struct {
 		lines []string
 		want  domain.EventKind
 	}{
-		"reasoning": {[]string{prompt, reasoning}, domain.EventStream},
-		"result":    {[]string{prompt, reasoning, call, output}, domain.EventReasoning},
-		"call":      {[]string{prompt, reasoning, call}, domain.EventToolCall},
-		"reply":     {[]string{prompt, reasoning, reply}, domain.EventTurnComplete},
+		"reasoning":                {[]string{prompt, reasoning}, domain.EventStream},
+		"result":                   {[]string{prompt, reasoning, call, output}, domain.EventReasoning},
+		"call":                     {[]string{prompt, reasoning, call}, domain.EventToolCall},
+		"reply":                    {[]string{prompt, reasoning, reply}, domain.EventTurnComplete},
+		"interrupted":              {[]string{prompt, reasoning, call, aborted}, domain.EventTurnComplete},
+		"interrupted-before-reply": {[]string{prompt, aborted}, domain.EventTurnComplete},
 	}
 	for id, c := range cases {
 		data := fmt.Sprintf(meta, id) + "\n" + strings.Join(c.lines, "\n") + "\n"

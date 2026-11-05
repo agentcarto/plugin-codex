@@ -48,7 +48,8 @@ func (Factory) Descriptor() plugin.Descriptor {
 	// ParserVersion=14: guardian decision labels are rendered in English.
 	// ParserVersion=15: task_complete ends the turn, so LastKind of a turn stopped by an
 	// error is no longer the last tool result; cached sessions must be parsed again.
-	return plugin.Descriptor{Type: "codex", DisplayName: "Codex", ParserVersion: "15", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	// ParserVersion=16: turn_aborted (an interrupt) ends the turn the same way.
+	return plugin.Descriptor{Type: "codex", DisplayName: "Codex", ParserVersion: "16", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
@@ -486,10 +487,12 @@ func (s *codexParse) eventMsg(p map[string]any, ts time.Time, turnID string) *do
 	switch common.String(p["type"]) {
 	case "turn_aborted":
 		s.pendingAbortTurnID = common.String(p["turn_id"])
+		fallthrough
 	case "task_complete":
 		// Ends the turn even when no assistant message was written (an error
-		// such as the spend cap stops it mid-tool-call); otherwise the last
-		// tool result keeps the session looking like it is still running.
+		// such as the spend cap, or an interrupt, stops it mid-tool-call);
+		// otherwise the last tool result keeps the session looking like it is
+		// still running.
 		return &domain.Event{Kind: domain.EventTurnComplete, Timestamp: ts, RawType: "turn_complete", TurnID: turnID}
 	case "thread_rolled_back":
 		return &domain.Event{Kind: domain.EventMeta, Text: fmt.Sprint(p["num_turns"]), Timestamp: ts, RawType: "thread_rolled_back", TurnID: turnID}
