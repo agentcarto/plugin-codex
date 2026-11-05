@@ -681,6 +681,25 @@ func TestParseCodexAssistantEmptyMessageIsTurnCompleteTail(t *testing.T) {
 	}
 }
 
+// A turn that stops on an error (e.g. spend cap) never emits an assistant
+// message, so task_complete is the only marker that the turn has ended.
+func TestParseCodexTaskCompleteWithoutAssistantMessageIsTurnCompleteTail(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "rollout-x-id.jsonl")
+	data := `{"timestamp":"2025-01-01T00:00:00Z","type":"session_meta","payload":{"id":"id","cwd":"/work"}}
+{"timestamp":"2025-01-01T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"hello"}]}}
+{"timestamp":"2025-01-01T00:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec","arguments":"{}","call_id":"c1"}}
+{"timestamp":"2025-01-01T00:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"ok"}}
+{"timestamp":"2025-01-01T00:00:04Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":null,"error":{"message":"spend cap"}}}
+`
+	if e := os.WriteFile(p, []byte(data), 0600); e != nil {
+		t.Fatal(e)
+	}
+	ev, _, _, _, _, _ := parse(context.Background(), p)
+	if got := ev[len(ev)-1].Kind; got != domain.EventTurnComplete {
+		t.Fatalf("last kind=%q events=%#v", got, ev)
+	}
+}
+
 func TestParseCodexAssistantTextMessageIsTurnCompleteTail(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "rollout-x-id.jsonl")
 	data := `{"timestamp":"2025-01-01T00:00:00Z","type":"session_meta","payload":{"id":"id","cwd":"/work"}}
