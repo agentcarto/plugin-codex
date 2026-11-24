@@ -51,7 +51,11 @@ func (Factory) Descriptor() plugin.Descriptor {
 	// ParserVersion=16: turn_aborted (an interrupt) ends the turn the same way.
 	// ParserVersion=17: LastKind skips compaction summaries, which a mid-turn compaction
 	// leaves after the turn's end.
-	return plugin.Descriptor{Type: "codex", DisplayName: "Codex", ParserVersion: "17", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	// ParserVersion=18: a request_user_input call becomes an EventQuestion and its
+	// output an EventAnswer, carrying what was asked and answered; they were an
+	// EventToolCall and an EventToolResult, which the host shows as a bare tool
+	// name and does not index.
+	return plugin.Descriptor{Type: "codex", DisplayName: "Codex", ParserVersion: "18", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
@@ -103,6 +107,10 @@ type codexParse struct {
 	// pendingCompacts holds mid-turn compaction events until the turn's items are
 	// done (the next task_started, or end of file).
 	pendingCompacts []domain.Event
+	// asked holds the questions of each ask call read as a question, by call_id:
+	// the output of such a call is the user's answers to them. It holds none for
+	// a call whose answers are not to be read (askQuestions).
+	asked map[string][]askedQuestion
 }
 
 func parse(ctx context.Context, path string) ([]domain.Event, string, string, string, string, time.Time) {
@@ -328,7 +336,9 @@ func (s *codexParse) consume(o map[string]any) {
 	}
 }
 
-// responseItem maps a "response_item" payload to its conversation event.
+// responseItem maps a "response_item" payload to its conversation event. A call
+// of the ask tool becomes the question it puts to the user (EventQuestion)
+// instead of a tool call, and its output the user's answer (EventAnswer).
 func (s *codexParse) responseItem(p map[string]any, ts time.Time, turnID string) *domain.Event {
 	pt := common.String(p["type"])
 	switch pt {
@@ -353,8 +363,23 @@ func (s *codexParse) responseItem(p map[string]any, ts time.Time, turnID string)
 		if text == "" {
 			text = common.String(p["input"])
 		}
+		if common.String(p["name"]) == askTool {
+			// A call that cannot be read stays a tool call, raw arguments and all.
+			if question, asked := askQuestions(text); question != "" {
+				if s.asked == nil {
+					s.asked = map[string][]askedQuestion{}
+				}
+				s.asked[common.String(p["call_id"])] = asked
+				return &domain.Event{Kind: domain.EventQuestion, Text: question, Timestamp: ts, RawType: pt, TurnID: turnID}
+			}
+		}
 		return &domain.Event{Kind: domain.EventToolCall, Text: text, Timestamp: ts, ToolName: common.String(p["name"]), RawType: pt, TurnID: turnID}
 	case "function_call_output", "local_shell_call_output", "custom_tool_call_output", "web_search_call_output":
+		if asked := s.asked[common.String(p["call_id"])]; len(asked) > 0 {
+			if answer := askAnswer(p["output"], asked); answer != "" {
+				return &domain.Event{Kind: domain.EventAnswer, Text: answer, Timestamp: ts, RawType: pt, TurnID: turnID}
+			}
+		}
 		return &domain.Event{Kind: domain.EventToolResult, Text: codexOutputText(p["output"]), Timestamp: ts, RawType: pt, TurnID: turnID}
 	case "tool_search_call":
 		// Arguments are a JSON object here, unlike function_call's pre-encoded
